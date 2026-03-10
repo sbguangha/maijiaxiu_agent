@@ -1,51 +1,64 @@
-from fastapi import FastAPI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.output_parsers import StrOutputParser
-from langserve import add_routes
-from dotenv import load_dotenv
+"""
+V2.0 买家秀生成 Agent - Web 服务入口
+提供：
+  1. 根路径 "/" 返回聊天界面
+  2. POST "/chat" 接收自然语言指令，调用 LangGraph Agent
+  3. "/static/*" 静态资源
+"""
 import os
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from agent_graph import run_agent
+import uvicorn
 
-# Load environment variables (OPENAI_API_KEY)
-load_dotenv()
-
-# Initialize FastAPI application
+# ===== FastAPI 应用 =====
 app = FastAPI(
-    title="小红书文案生成器 API",
-    version="1.0",
-    description="根据主题自动生成三个爆款小红书标题的智能助手。"
+    title="买家秀生成 Agent V2.0",
+    version="2.0",
+    description="输入商品链接或描述，Agent 自主决策生成真实买家评价。"
 )
 
-# 1. Initialize language model
-# 使用 Moonshot (Kimi) 的兼容接口
-# Kimi 的大模型名为 moonshot-v1-8k
-model = ChatOpenAI(
-    api_key=os.getenv("MOONSHOT_API_KEY"),
-    base_url="https://api.moonshot.cn/v1",
-    model="moonshot-v1-8k",
-    temperature=0.7
-)
+# 挂载静态资源
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
-# 2. Create the Prompt Template
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "你是一个精通全网爆款逻辑的小红书文案专家。请根据用户提供的主题，自动思考用户的受众痛点，并生成三个极具网感、带有恰当emoji、能引起强烈共鸣或好奇心的小红书爆款标题。每个标题之间请换行，直接输出文本即可不用做别的废话。"),
-    ("user", "主题：{topic}")
-])
 
-# 3. Create LangChain Expression Language (LCEL) Chain
-# The StrOutputParser simply extracts the string output from the LLM message
-chain = prompt | model | StrOutputParser()
+# ===== 根路径：返回聊天页面 =====
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    index_path = os.path.join(BASE_DIR, "static", "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
-# 4. Integrate with LangServe
-# This automatically wraps our chain into an API and creates a Playground at /copywriter/playground
-add_routes(
-    app,
-    chain,
-    path="/copywriter"
-)
+
+# ===== 聊天 API：前端调用 =====
+@app.post("/chat")
+async def chat(request: Request):
+    """
+    接收前端的自然语言指令，交给 LangGraph Agent 处理。
+    前端发送: {"user_input": "帮我生成5条评价，商品：xxx"}
+    返回: {"reply": "Agent 生成的完整回复文本"}
+    """
+    try:
+        payload = await request.json()
+        user_input = payload.get("user_input", "")
+        
+        if not user_input.strip():
+            return JSONResponse(content={"reply": "请输入商品名称、卖点或链接。"})
+        
+        # 调用 LangGraph Agent（同步调用，在线程池中执行）
+        import asyncio
+        result = await asyncio.to_thread(run_agent, user_input)
+        
+        return JSONResponse(content={"reply": result})
+    
+    except Exception as e:
+        return JSONResponse(
+            content={"reply": f"⚠️ 处理出错：{str(e)}\n请稍后重试，可能是 API 暂时过载。"},
+            status_code=200  # 前端统一用200处理，错误信息在reply里
+        )
+
 
 if __name__ == "__main__":
-    import uvicorn
-    # Start the application using Uvicorn
-    # Make sure port 8000 is available, if not it will throw an error
     uvicorn.run(app, host="127.0.0.1", port=8000)
