@@ -150,4 +150,53 @@ def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> 
         "selling_points": selling_points,
         "count": count
     })
+    
+    # --- 自动回写飞书逻辑 ---
+    try:
+        FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
+        FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+        FEISHU_APP_TOKEN = os.getenv("FEISHU_APP_TOKEN")
+        FEISHU_TABLE_ID = os.getenv("FEISHU_TABLE_ID")
+        
+        if all([FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_APP_TOKEN, FEISHU_TABLE_ID]):
+            # 1. 获取 token
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = requests.post(token_url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).json()
+            
+            if token_resp.get("code") == 0:
+                token = token_resp.get("tenant_access_token")
+                
+                # 2. 解析大模型返回的纯文本结果，提取成结构化字典
+                records = []
+                # 按照 "评价1：" "评价2：" 分块
+                blocks = re.split(r'评价\d+：?', result)
+                for block in blocks:
+                    if not block.strip(): 
+                        continue
+                    
+                    # 提取内容和配图建议
+                    content_match = re.search(r'内容：(.*?)(?=\n配图建议：|$)', block, re.DOTALL)
+                    photo_match = re.search(r'配图建议：(.*?)(?=\n评价|$)', block, re.DOTALL)
+                    
+                    if content_match:
+                        records.append({
+                            "fields": {
+                                "商品名称": product_name,
+                                "评价内容": content_match.group(1).strip(),
+                                "配图建议": photo_match.group(1).strip() if photo_match else ""
+                            }
+                        })
+                
+                # 3. 批量发送给飞书表格
+                if records:
+                    write_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records/batch_create"
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json; charset=utf-8"
+                    }
+                    requests.post(write_url, headers=headers, json={"records": records})
+    except Exception as e:
+        # 即使写入飞书失败，也不影响大模型把结果返回给前端用户
+        print(f"写入飞书失败: {str(e)}")
+        
     return result
