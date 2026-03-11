@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,13 +8,14 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
+
 <body>
   <div class="chat-container">
     <header class="chat-header">
       <div class="header-icon">🛍️</div>
       <div>
         <h1>买家秀智能生成 Agent</h1>
-        <p class="subtitle">输入商品名称或链接，自动生成真实买家评价</p>
+        <p class="subtitle">输入商品名称生成评价 · 上传白底图生成买家秀配图</p>
       </div>
     </header>
 
@@ -21,16 +23,27 @@
       <div class="message bot">
         <div class="msg-content">
           👋 你好！我是买家秀生成 Agent。<br><br>
-          你可以这样跟我说：<br>
+          <strong>📝 生成评价文案：</strong><br>
           • <em>"帮我生成5条评价，商品：2025新款碎花连衣裙"</em><br>
-          • <em>"商品叫冬季加厚羽绒服女，卖点是显瘦保暖，生成3条评价"</em><br>
-          • <em>直接粘贴一个淘宝/天猫链接</em>
+          • <em>"商品叫冬季加厚羽绒服女，卖点是显瘦保暖，生成3条评价"</em><br><br>
+          <strong>📸 生成买家秀配图：</strong><br>
+          • 点击下方的 📸 按钮上传商品白底图<br>
+          • 在输入框填写商品名称（如"白色V领雪纺衬衫"）<br>
+          • AI 将自动生成多个生活场景的买家秀图片
         </div>
       </div>
     </div>
 
     <div class="input-area">
-      <textarea id="userInput" rows="1" placeholder="输入商品名称、卖点或链接，按 Enter 发送…"></textarea>
+      <!-- 隐藏的文件上传 input -->
+      <input type="file" id="imageInput" accept="image/*" style="display: none;">
+
+      <!-- 上传图片按钮 -->
+      <button id="uploadBtn" class="upload-btn" title="上传商品白底图生成买家秀配图">
+        📸
+      </button>
+
+      <textarea id="userInput" rows="1" placeholder="输入商品名称或链接，按 Enter 生成评价…"></textarea>
       <button id="sendBtn">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -42,4 +55,5 @@
 
   <script src="/static/script.js"></script>
 </body>
+
 </html>
