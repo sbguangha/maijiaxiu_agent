@@ -4,6 +4,7 @@ V2.0 LangGraph Agent
 """
 
 import os
+import time
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -52,11 +53,23 @@ agent = create_react_agent(
 def run_agent(user_input: str) -> str:
     """
     运行 Agent，传入用户的自然语言指令，返回最终结果。
+    内置 429 过载重试机制。
     """
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": user_input}]}
-    )
-    
-    # 提取最后一条 AI 消息作为最终输出
-    final_message = result["messages"][-1].content
-    return final_message
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": user_input}]}
+            )
+            return result["messages"][-1].content
+            
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"  ⚠️ Kimi Agent API 过载，{wait_time} 秒后自动重试（第 {attempt+1}/{max_retries} 次）...")
+                time.sleep(wait_time)
+            else:
+                if "429" in str(e):
+                    return f"⚠️ 抱歉，Kimi API 持续过载，已重试 {max_retries} 次均失败，请稍后重试。"
+                raise e # 抛出其他非 429 错误
+

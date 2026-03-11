@@ -40,7 +40,7 @@ _llm = ChatOpenAI(
 
 
 # ========== 1. 生成场景 Prompt ==========
-def generate_scene_prompts(product_name: str, scene_count: int = 5) -> list[str]:
+def generate_scene_prompts(product_name: str, scene_count: int = 2) -> list[str]:
     """
     调用 Kimi，根据商品名称生成 N 个适合 doubao-seedream 的图生图 Prompt。
     每个 Prompt 描述一个不同的买家秀生活场景。
@@ -257,7 +257,7 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
 
 
 # ========== 4. 主流程编排 ==========
-def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int = 5) -> dict:
+def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int = 2) -> dict:
     """
     完整的图片生成主流程：
     1. 上传白底图到飞书 → 拿到 file_token 和公网 URL

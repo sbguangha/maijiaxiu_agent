@@ -4,6 +4,12 @@ const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
 const uploadBtn = document.getElementById('uploadBtn');
 const imageInput = document.getElementById('imageInput');
+const imagePreview = document.getElementById('imagePreview');
+const previewImg = document.getElementById('previewImg');
+const removeImgBtn = document.getElementById('removeImgBtn');
+
+// ===== 状态：当前附带的图片文件 =====
+let attachedFile = null;
 
 // ===== 工具函数 =====
 function scrollToBottom() {
@@ -20,7 +26,7 @@ function addMessage(content, role) {
   if (role === 'bot') {
     contentDiv.innerHTML = content;
   } else {
-    contentDiv.textContent = content;
+    contentDiv.innerHTML = content;
   }
 
   msgDiv.appendChild(contentDiv);
@@ -43,6 +49,16 @@ function showTyping(text) {
   scrollToBottom();
 }
 
+function updateTypingText(text) {
+  const el = document.getElementById('typing');
+  if (el) {
+    const textSpan = el.querySelector('.typing-text');
+    if (textSpan) {
+      textSpan.textContent = text;
+    }
+  }
+}
+
 function removeTyping() {
   const el = document.getElementById('typing');
   if (el) el.remove();
@@ -54,47 +70,134 @@ function setInputsDisabled(disabled) {
   uploadBtn.disabled = disabled;
 }
 
-// ===== 发送文字消息（生成评价） =====
-async function sendMessage() {
-  const content = userInput.value.trim();
-  if (!content) return;
+function escapeHtml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>');
+}
 
-  // 显示用户消息
-  addMessage(content, 'user');
+// ===== 图片附件管理 =====
+function attachImage(file) {
+  attachedFile = file;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    previewImg.src = e.target.result;
+    imagePreview.style.display = 'flex';
+  };
+  reader.readAsDataURL(file);
+}
+
+function removeImage() {
+  attachedFile = null;
+  previewImg.src = '';
+  imagePreview.style.display = 'none';
+  imageInput.value = '';
+}
+
+// ===== 统一发送（文字 / 文字+图片） =====
+async function sendMessage() {
+  const text = userInput.value.trim();
+  const hasImage = !!attachedFile;
+
+  // 至少要有文字或图片
+  if (!text && !hasImage) return;
+
+  // ---- 构建用户消息展示 ----
+  let userHtml = '';
+  if (hasImage) {
+    userHtml += `<img src="${previewImg.src}" class="preview-img" alt="商品白底图">`;
+    if (text) userHtml += '<br>';
+  }
+  if (text) {
+    userHtml += escapeHtml(text);
+  }
+  addMessage(userHtml, 'user');
+
+  // 清空输入区
+  const currentText = text;
+  const currentFile = attachedFile;
   userInput.value = '';
   userInput.style.height = 'auto';
+  removeImage();
 
   // 禁用输入
   setInputsDisabled(true);
 
-  // 显示加载动画
-  showTyping('正在生成评价…');
-
   try {
-    const resp = await fetch('/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_input: content })
-    });
+    if (hasImage) {
+      // ===== 有图片：走合并接口 =====
+      showTyping('正在生成评价…');
 
-    removeTyping();
+      const formData = new FormData();
+      formData.append('file', currentFile);
+      formData.append('user_input', currentText);
 
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+      const resp = await fetch('/chat-with-image', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+
+      removeTyping();
+
+      // 显示评价文字
+      if (data.reply) {
+        addMessage(escapeHtml(data.reply), 'bot');
+      }
+
+      // 显示晒图结果
+      if (data.image_result) {
+        let imgHtml = '';
+        const ir = data.image_result;
+
+        if (ir.status === 'success' || ir.status === 'partial') {
+          imgHtml += `<strong>${ir.message}</strong><br><br>`;
+
+          if (ir.prompts && ir.prompts.length > 0) {
+            imgHtml += '<strong>🎨 场景描述：</strong><br>';
+            ir.prompts.forEach((p, i) => {
+              imgHtml += `${i + 1}. ${escapeHtml(p)}<br>`;
+            });
+            imgHtml += '<br>';
+          }
+
+          if (ir.image_urls && ir.image_urls.length > 0) {
+            imgHtml += '<strong>🖼️ 生成的买家秀晒图：</strong><br>';
+            imgHtml += '<div class="generated-images">';
+            ir.image_urls.forEach((url, i) => {
+              imgHtml += `<img src="${url}" alt="场景${i + 1}" class="generated-img" loading="lazy">`;
+            });
+            imgHtml += '</div>';
+          }
+        } else {
+          imgHtml = `❌ ${ir.message || '晒图生成失败'}`;
+        }
+
+        addMessage(imgHtml, 'bot');
+      }
+
+    } else {
+      // ===== 纯文字：走原来的 /chat =====
+      showTyping('正在生成评价…');
+
+      const resp = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_input: currentText })
+      });
+
+      removeTyping();
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+
+      const reply = data.reply || '抱歉，生成失败了。';
+      addMessage(escapeHtml(reply), 'bot');
     }
-
-    const data = await resp.json();
-
-    // 将 Agent 返回的纯文本渲染为 HTML
-    const reply = data.reply || '抱歉，生成失败了，请稍后重试。';
-    // 把换行转为 <br>，保留格式
-    const formatted = reply
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/\n/g, '<br>');
-
-    addMessage(formatted, 'bot');
 
   } catch (e) {
     removeTyping();
@@ -103,91 +206,6 @@ async function sendMessage() {
   } finally {
     setInputsDisabled(false);
     userInput.focus();
-  }
-}
-
-// ===== 上传图片并生成买家秀配图 =====
-async function uploadAndGenerate(file) {
-  const productName = userInput.value.trim() || '服装商品';
-  const sceneCount = 5;
-
-  // 显示用户消息（带图片预览）
-  const reader = new FileReader();
-  reader.onload = function (e) {
-    addMessage(
-      `<img src="${e.target.result}" class="preview-img" alt="商品白底图"><br>📸 商品: ${productName}<br>正在生成买家秀配图...`,
-      'user'
-    );
-  };
-  reader.readAsDataURL(file);
-
-  userInput.value = '';
-  userInput.style.height = 'auto';
-
-  // 禁用输入
-  setInputsDisabled(true);
-
-  // 显示加载动画
-  showTyping('正在生成买家秀配图，约需 30-60 秒…');
-
-  try {
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('product_name', productName);
-    formData.append('scene_count', '5');
-
-    const resp = await fetch('/generate-lifestyle-images', {
-      method: 'POST',
-      body: formData
-    });
-
-    removeTyping();
-
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
-    }
-
-    const data = await resp.json();
-
-    // 构建结果 HTML
-    let html = '';
-
-    if (data.status === 'success' || data.status === 'partial') {
-      html += `<strong>${data.message}</strong><br><br>`;
-
-      // 显示场景 Prompt 列表
-      if (data.prompts && data.prompts.length > 0) {
-        html += '<strong>🎨 生成的场景描述：</strong><br>';
-        data.prompts.forEach((p, i) => {
-          html += `${i + 1}. ${p.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br>`;
-        });
-        html += '<br>';
-      }
-
-      // 显示生成的图片
-      if (data.image_urls && data.image_urls.length > 0) {
-        html += '<strong>🖼️ 生成的买家秀配图：</strong><br>';
-        html += '<div class="generated-images">';
-        data.image_urls.forEach((url, i) => {
-          html += `<img src="${url}" alt="场景${i + 1}" class="generated-img" loading="lazy">`;
-        });
-        html += '</div>';
-      }
-    } else {
-      html = `❌ ${data.message || '生成失败，请检查配置。'}`;
-    }
-
-    addMessage(html, 'bot');
-
-  } catch (e) {
-    removeTyping();
-    addMessage('❌ 图片生成出错：' + e.message + '<br>请检查 DOUBAO_API_KEY 是否配置正确。', 'bot');
-    console.error(e);
-  } finally {
-    setInputsDisabled(false);
-    userInput.focus();
-    // 清空文件选择，允许重复选择同一文件
-    imageInput.value = '';
   }
 }
 
@@ -207,25 +225,20 @@ userInput.addEventListener('input', () => {
   userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
 });
 
-// 📸 上传按钮触发文件选择
+// 📸 按钮：选择文件（不发送）
 uploadBtn.addEventListener('click', () => {
   imageInput.click();
 });
 
-// 文件选择后，先弹窗让用户输入商品名称，再触发生成
+// 文件选中后：只显示预览，不发送
 imageInput.addEventListener('change', (e) => {
   const file = e.target.files[0];
-  if (!file) return;
-
-  // 如果输入框里已经有文字，直接使用；否则弹窗询问
-  let name = userInput.value.trim();
-  if (!name) {
-    name = prompt('请输入商品名称（如：白色V领针织开衫）：', '服装商品');
-    if (!name) {
-      imageInput.value = '';
-      return; // 用户点了取消
-    }
+  if (file) {
+    attachImage(file);
   }
-  userInput.value = name;
-  uploadAndGenerate(file);
+});
+
+// 移除已附带的图片
+removeImgBtn.addEventListener('click', () => {
+  removeImage();
 });

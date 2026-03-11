@@ -5,7 +5,9 @@ V2.0 Agent 工具集
 
 import os
 import re
+import time
 import requests
+import json
 from bs4 import BeautifulSoup
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
@@ -98,8 +100,22 @@ def extract_selling_points(product_info: str) -> str:
     ])
     
     chain = prompt | _llm | StrOutputParser()
-    result = chain.invoke({"product_info": product_info})
-    return result.strip()
+    
+    # 自动重试机制
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = chain.invoke({"product_info": product_info})
+            return result.strip()
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"  ⚠️ 提取卖点 API 过载，{wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                if attempt == max_retries - 1:
+                    return f"提取卖点失败（API过载）：{str(e)}"
+                raise e
 
 
 # ========== Tool 3: 评价生成器 ==========
@@ -145,11 +161,26 @@ def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> 
     ])
     
     chain = prompt | _llm | StrOutputParser()
-    result = chain.invoke({
-        "product_name": product_name,
-        "selling_points": selling_points,
-        "count": count
-    })
+    
+    result = ""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = chain.invoke({
+                "product_name": product_name,
+                "selling_points": selling_points,
+                "count": count
+            })
+            break
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)
+                print(f"  ⚠️ 生成评价 API 过载，{wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                if attempt == max_retries - 1:
+                    return f"生成评价失败（API过载），请稍后重试。"
+                raise e
     
     # --- 自动回写飞书逻辑 ---
     try:

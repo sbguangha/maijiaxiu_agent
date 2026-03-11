@@ -15,7 +15,7 @@
       <div class="header-icon">🛍️</div>
       <div>
         <h1>买家秀智能生成 Agent</h1>
-        <p class="subtitle">输入商品名称生成评价 · 上传白底图生成买家秀配图</p>
+        <p class="subtitle">输入商品信息生成评价 · 附带白底图一键生成晒图</p>
       </div>
     </header>
 
@@ -23,33 +23,39 @@
       <div class="message bot">
         <div class="msg-content">
           👋 你好！我是买家秀生成 Agent。<br><br>
-          <strong>📝 生成评价文案：</strong><br>
-          • <em>"帮我生成5条评价，商品：2025新款碎花连衣裙"</em><br>
-          • <em>"商品叫冬季加厚羽绒服女，卖点是显瘦保暖，生成3条评价"</em><br><br>
-          <strong>📸 生成买家秀配图：</strong><br>
-          • 点击下方的 📸 按钮上传商品白底图<br>
-          • 在输入框填写商品名称（如"白色V领雪纺衬衫"）<br>
-          • AI 将自动生成多个生活场景的买家秀图片
+          <strong>💬 纯文字：</strong>生成评价<br>
+          • <em>"帮我生成3条评价，商品：白色V领针织开衫"</em><br><br>
+          <strong>📸 文字 + 图片：</strong>生成评价 + 晒图<br>
+          • 先点 📸 附上商品白底图<br>
+          • 再在输入框填写指令（如上）<br>
+          • 最后点击发送按钮 ▶
         </div>
       </div>
     </div>
 
     <div class="input-area">
-      <!-- 隐藏的文件上传 input -->
+      <!-- 隐藏的文件 input -->
       <input type="file" id="imageInput" accept="image/*" style="display: none;">
 
-      <!-- 上传图片按钮 -->
-      <button id="uploadBtn" class="upload-btn" title="上传商品白底图生成买家秀配图">
-        📸
-      </button>
+      <!-- 图片预览区（选中图片后才显示） -->
+      <div id="imagePreview" class="image-preview" style="display: none;">
+        <img id="previewImg" src="" alt="预览">
+        <button id="removeImgBtn" class="remove-img-btn" title="移除图片">✕</button>
+      </div>
 
-      <textarea id="userInput" rows="1" placeholder="输入商品名称或链接，按 Enter 生成评价…"></textarea>
-      <button id="sendBtn">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="22" y1="2" x2="11" y2="13"></line>
-          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-        </svg>
-      </button>
+      <div class="input-row">
+        <!-- 上传按钮 -->
+        <button id="uploadBtn" class="upload-btn" title="附上商品白底图">📸</button>
+        <!-- 文字输入 -->
+        <textarea id="userInput" rows="1" placeholder="输入商品名称和评价数量，按 Enter 发送…"></textarea>
+        <!-- 发送按钮 -->
+        <button id="sendBtn">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="22" y1="2" x2="11" y2="13"></line>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+          </svg>
+        </button>
+      </div>
     </div>
   </div>
 

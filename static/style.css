@@ -219,11 +219,58 @@ body {
 /* ===== 输入区域 ===== */
 .input-area {
   display: flex;
-  align-items: flex-end;
-  gap: 0.6rem;
-  padding: 1rem 1.2rem;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.8rem 1.2rem;
   border-top: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.02);
+}
+
+/* 图片预览条 */
+.image-preview {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: fit-content;
+}
+
+.image-preview img {
+  width: 56px;
+  height: 56px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.remove-img-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.remove-img-btn:hover {
+  background: rgba(255, 80, 80, 0.3);
+  color: #ff6b6b;
+}
+
+/* 输入行：📸 + 输入框 + 发送按钮 */
+.input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.6rem;
 }
 
 .input-area textarea {
