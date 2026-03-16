@@ -165,7 +165,11 @@ async def chat_with_image(
         if table_file is not None:
             file_paths.extend(await _save_uploaded_files([table_file], prefix="table"))
 
-        contacts = _parse_target_contacts(target_contacts or target_contact or DEFAULT_TARGET_CONTACTS)
+        # 如果前端没传联系人，强制使用环境变量
+        raw_contacts = target_contacts or target_contact
+        if not raw_contacts:
+            raw_contacts = DEFAULT_TARGET_CONTACTS
+        contacts = _parse_target_contacts(raw_contacts)
         local_images = _materialize_generated_images(image_result)
 
         if enqueue_for_delivery and contacts:
