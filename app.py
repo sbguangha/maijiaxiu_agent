@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -19,17 +20,25 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 from outbox import (
     ensure_outbox_db,
     enqueue_task,
     reserve_next_task,
+    peek_next_due_task,
     ack_success,
     ack_failure,
     list_tasks,
     requeue_dead_letter,
+    recover_processing_task,
 )
 import uvicorn
+
+# 优先加载项目根目录 .env，确保默认联系人等配置生效
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("outbox-api")
 
 # ===== FastAPI 应用 =====
 app = FastAPI(
@@ -75,6 +84,11 @@ class OutboxHeartbeatRequest(BaseModel):
     status: str = Field(default="ok", description="实例状态")
     current_task_id: str = Field(default="", description="当前任务")
     meta: Dict[str, Any] = Field(default_factory=dict, description="附加信息")
+
+
+class OutboxRecoverRequest(BaseModel):
+    task_id: str = Field(..., description="任务 ID")
+    note: str = Field(default="", description="恢复备注")
 
 
 def _get_generation_runners():
@@ -361,12 +375,39 @@ async def get_next_outbox_task(worker_id: str = Query(default="yingdao-worker"))
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+@app.get("/outbox/peek")
+async def peek_outbox_task():
+    """
+    只查看下一条可处理任务，不改变任务状态。
+    """
+    try:
+        task = peek_next_due_task(OUTBOX_DB_PATH)
+        if not task:
+            return JSONResponse(content={"task": None, "message": "no_due_task"})
+        return JSONResponse(content={"task": _task_to_dict(task)})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
 @app.post("/outbox/ack-success")
 async def post_outbox_ack_success(payload: OutboxAckSuccessRequest):
     try:
-        task = ack_success(OUTBOX_DB_PATH, payload.task_id)
+        logger.info(
+            "ack-success request: task_id=%s worker_id=%s note=%s",
+            payload.task_id,
+            payload.worker_id,
+            payload.note,
+        )
+        task = ack_success(OUTBOX_DB_PATH, payload.task_id, payload.worker_id)
         if not task:
+            logger.warning("ack-success task_not_found: task_id=%s", payload.task_id)
             return JSONResponse(content={"error": "task_not_found"}, status_code=404)
+        logger.info(
+            "ack-success updated: task_id=%s status=%s retry_count=%s",
+            task.task_id,
+            task.status,
+            task.retry_count,
+        )
         _append_heartbeat(
             {
                 "event": "ack_success",
@@ -377,7 +418,16 @@ async def post_outbox_ack_success(payload: OutboxAckSuccessRequest):
         )
         return JSONResponse(content={"task": _task_to_dict(task)})
     except Exception as e:
+        logger.exception("ack-success exception: task_id=%s", payload.task_id)
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/outbox/ack_success")
+async def post_outbox_ack_success_alias(payload: OutboxAckSuccessRequest):
+    """
+    兼容下划线路径，避免客户端路径拼写差异导致未命中。
+    """
+    return await post_outbox_ack_success(payload)
 
 
 @app.post("/outbox/ack-failure")
@@ -406,10 +456,29 @@ async def post_outbox_ack_failure(payload: OutboxAckFailureRequest):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+@app.post("/outbox/ack_failure")
+async def post_outbox_ack_failure_alias(payload: OutboxAckFailureRequest):
+    """
+    兼容下划线路径，避免客户端路径拼写差异导致未命中。
+    """
+    return await post_outbox_ack_failure(payload)
+
+
 @app.post("/outbox/requeue/{task_id}")
 async def post_outbox_requeue(task_id: str):
     try:
         task = requeue_dead_letter(OUTBOX_DB_PATH, task_id)
+        if not task:
+            return JSONResponse(content={"error": "task_not_found"}, status_code=404)
+        return JSONResponse(content={"task": _task_to_dict(task)})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/outbox/recover-processing")
+async def post_outbox_recover_processing(payload: OutboxRecoverRequest):
+    try:
+        task = recover_processing_task(OUTBOX_DB_PATH, payload.task_id, payload.note)
         if not task:
             return JSONResponse(content={"error": "task_not_found"}, status_code=404)
         return JSONResponse(content={"task": _task_to_dict(task)})

@@ -278,6 +278,8 @@ def enqueue_task(
 
 def reserve_next_task(db_path: str, worker_id: str) -> OutboxTask | None:
     now = _utc_now()
+    lease_timeout_sec = int(os.getenv("OUTBOX_PROCESSING_TIMEOUT_SEC", "120") or "120")
+    stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
     with _LOCK:
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -285,12 +287,21 @@ def reserve_next_task(db_path: str, worker_id: str) -> OutboxTask | None:
             row = conn.execute(
                 """
                 SELECT * FROM outbox_tasks
-                WHERE status IN ('pending', 'retry')
-                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                WHERE (
+                    (
+                        status IN ('pending', 'retry')
+                        AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                    )
+                    OR (
+                        status = 'processing'
+                        AND reserved_at IS NOT NULL
+                        AND reserved_at <= ?
+                    )
+                )
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
-                (_to_iso(now),),
+                (_to_iso(now), _to_iso(stale_deadline)),
             ).fetchone()
             if not row:
                 return None
@@ -310,23 +321,102 @@ def reserve_next_task(db_path: str, worker_id: str) -> OutboxTask | None:
             return OutboxTask.from_row(reserved) if reserved else None
 
 
-def ack_success(db_path: str, task_id: str) -> OutboxTask | None:
+def peek_next_due_task(db_path: str) -> OutboxTask | None:
+    """
+    只查看下一条可处理任务，不改变任务状态。
+    """
     now = _utc_now()
+    lease_timeout_sec = int(os.getenv("OUTBOX_PROCESSING_TIMEOUT_SEC", "120") or "120")
+    stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
-        conn.execute(
-            """
-            UPDATE outbox_tasks
-            SET status = 'success', last_error = NULL, next_retry_at = NULL, reserved_by = NULL, reserved_at = NULL, updated_at = ?
-            WHERE task_id = ?
-            """,
-            (_to_iso(now), task_id),
-        )
         row = conn.execute(
-            "SELECT * FROM outbox_tasks WHERE task_id = ?",
-            (task_id,),
+            """
+            SELECT * FROM outbox_tasks
+            WHERE (
+                (
+                    status IN ('pending', 'retry')
+                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                )
+                OR (
+                    status = 'processing'
+                    AND reserved_at IS NOT NULL
+                    AND reserved_at <= ?
+                )
+            )
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (_to_iso(now), _to_iso(stale_deadline)),
         ).fetchone()
         return OutboxTask.from_row(row) if row else None
+
+
+def ack_success(db_path: str, task_id: str, worker_id: str = "") -> OutboxTask | None:
+    now = _utc_now()
+    with _LOCK:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+
+            # 先读取当前状态用于日志和诊断
+            before = conn.execute(
+                "SELECT task_id, status, reserved_by FROM outbox_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if not before:
+                conn.commit()
+                return None
+
+            # 仅允许处理中的任务被确认成功；worker_id 传入时会尝试匹配
+            if worker_id:
+                cur = conn.execute(
+                    """
+                    UPDATE outbox_tasks
+                    SET status = 'completed',
+                        last_error = NULL,
+                        next_retry_at = NULL,
+                        reserved_by = NULL,
+                        reserved_at = NULL,
+                        updated_at = ?
+                    WHERE task_id = ?
+                      AND status = 'processing'
+                      AND (reserved_by IS NULL OR reserved_by = ?)
+                    """,
+                    (_to_iso(now), task_id, worker_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE outbox_tasks
+                    SET status = 'completed',
+                        last_error = NULL,
+                        next_retry_at = NULL,
+                        reserved_by = NULL,
+                        reserved_at = NULL,
+                        updated_at = ?
+                    WHERE task_id = ?
+                      AND status = 'processing'
+                    """,
+                    (_to_iso(now), task_id),
+                )
+
+            affected = cur.rowcount
+            # 如果未更新，尝试兼容旧状态 success/completed 的幂等确认
+            if affected == 0:
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM outbox_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                return OutboxTask.from_row(row) if row else None
+
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM outbox_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return OutboxTask.from_row(row) if row else None
 
 
 def ack_failure(db_path: str, task_id: str, error_message: str) -> OutboxTask | None:
@@ -398,6 +488,42 @@ def requeue_dead_letter(db_path: str, task_id: str) -> OutboxTask | None:
                 WHERE task_id = ?
                 """,
                 (_to_iso(now), _to_iso(now), task_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM outbox_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            return OutboxTask.from_row(updated) if updated else None
+
+
+def recover_processing_task(db_path: str, task_id: str, note: str = "") -> OutboxTask | None:
+    """
+    手动恢复卡在 processing 的任务到 retry。
+    """
+    now = _utc_now()
+    with _LOCK:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM outbox_tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return None
+            task = OutboxTask.from_row(row)
+            if task.status != "processing":
+                return task
+
+            detail = f"[manual_recover] {note}".strip()
+            conn.execute(
+                """
+                UPDATE outbox_tasks
+                SET status = 'retry', next_retry_at = ?, reserved_by = NULL, reserved_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (_to_iso(now), detail[:2000], _to_iso(now), task_id),
             )
             updated = conn.execute(
                 "SELECT * FROM outbox_tasks WHERE task_id = ?",
