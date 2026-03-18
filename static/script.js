@@ -1,244 +1,144 @@
-// ===== DOM 元素 =====
-const chatLog = document.getElementById('chatLog');
-const userInput = document.getElementById('userInput');
-const sendBtn = document.getElementById('sendBtn');
-const uploadBtn = document.getElementById('uploadBtn');
-const imageInput = document.getElementById('imageInput');
-const imagePreview = document.getElementById('imagePreview');
-const previewImg = document.getElementById('previewImg');
-const removeImgBtn = document.getElementById('removeImgBtn');
+const previewBtn = document.getElementById('previewBtn');
+const generateBtn = document.getElementById('generateBtn');
+const statusBadge = document.getElementById('statusBadge');
+const progressArea = document.getElementById('progressArea');
+const progressBar = document.getElementById('progressBar');
+const progressText = document.getElementById('progressText');
+const tableArea = document.getElementById('tableArea');
 
-// ===== 状态：当前附带的图片文件 =====
-let attachedFile = null;
+let previewRows = [];
 
-// ===== 工具函数 =====
-function scrollToBottom() {
-  chatLog.scrollTop = chatLog.scrollHeight;
-}
+previewBtn.addEventListener('click', loadPreview);
+generateBtn.addEventListener('click', startBatchGenerate);
 
-function addMessage(content, role) {
-  const msgDiv = document.createElement('div');
-  msgDiv.className = `message ${role}`;
+async function loadPreview() {
+  previewBtn.disabled = true;
+  previewBtn.textContent = '读取中...';
+  generateBtn.disabled = true;
 
-  const contentDiv = document.createElement('div');
-  contentDiv.className = 'msg-content';
+  try {
+    const resp = await fetch('/batch-generate/preview');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
 
-  if (role === 'bot') {
-    contentDiv.innerHTML = content;
-  } else {
-    contentDiv.innerHTML = content;
-  }
+    if (data.error) throw new Error(data.error);
 
-  msgDiv.appendChild(contentDiv);
-  chatLog.appendChild(msgDiv);
-  scrollToBottom();
-  return msgDiv;
-}
+    previewRows = data.rows || [];
+    renderPreviewTable(previewRows);
 
-function showTyping(text) {
-  const msgDiv = document.createElement('div');
-  msgDiv.className = 'message bot';
-  msgDiv.id = 'typing';
-
-  const indicator = document.createElement('div');
-  indicator.className = 'typing-indicator';
-  indicator.innerHTML = `<span></span><span></span><span></span>${text ? `<span class="typing-text">${text}</span>` : ''}`;
-
-  msgDiv.appendChild(indicator);
-  chatLog.appendChild(msgDiv);
-  scrollToBottom();
-}
-
-function updateTypingText(text) {
-  const el = document.getElementById('typing');
-  if (el) {
-    const textSpan = el.querySelector('.typing-text');
-    if (textSpan) {
-      textSpan.textContent = text;
+    if (previewRows.length > 0) {
+      generateBtn.disabled = false;
     }
+  } catch (e) {
+    tableArea.innerHTML = `<div class="empty-state">读取失败: ${escapeHtml(e.message)}</div>`;
+  } finally {
+    previewBtn.disabled = false;
+    previewBtn.textContent = '读取需求表';
   }
 }
 
-function removeTyping() {
-  const el = document.getElementById('typing');
-  if (el) el.remove();
+function renderPreviewTable(rows) {
+  if (!rows.length) {
+    tableArea.innerHTML = '<div class="empty-state">需求表为空</div>';
+    return;
+  }
+
+  let html = '<div class="table-scroll"><table class="data-table">';
+  html += `<thead><tr>
+    <th>#</th>
+    <th>商品标题</th>
+    <th>平铺图</th>
+    <th>评价数</th>
+    <th>晒图数</th>
+    <th>状态</th>
+    <th>备注</th>
+  </tr></thead><tbody>`;
+
+  rows.forEach((row, i) => {
+    html += `<tr id="row-${row.record_id}">
+      <td>${i + 1}</td>
+      <td class="cell-title" title="${escapeHtml(row.product_title)}">${escapeHtml(row.product_title)}</td>
+      <td>${row.has_image
+        ? '<span class="has-image-yes">有</span>'
+        : '<span class="has-image-no">无</span>'}</td>
+      <td>${row.review_count}</td>
+      <td>${row.image_count}</td>
+      <td><span class="row-status pending">待处理</span></td>
+      <td></td>
+    </tr>`;
+  });
+
+  html += '</tbody></table></div>';
+  tableArea.innerHTML = html;
 }
 
-function setInputsDisabled(disabled) {
-  userInput.disabled = disabled;
-  sendBtn.disabled = disabled;
-  uploadBtn.disabled = disabled;
+async function startBatchGenerate() {
+  previewBtn.disabled = true;
+  generateBtn.disabled = true;
+  progressArea.classList.remove('hidden');
+  progressBar.style.width = '0%';
+  progressText.textContent = '正在批量生成，请勿关闭页面...';
+
+  setBadge('running', '生成中...');
+
+  try {
+    const resp = await fetch('/batch-generate', { method: 'POST' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+
+    if (data.error) throw new Error(data.error);
+
+    const results = data.results || [];
+    const total = data.total || 0;
+    const successCount = data.success_count || 0;
+
+    progressBar.style.width = '100%';
+    progressText.textContent = `完成: ${successCount}/${total} 成功`;
+
+    updateTableWithResults(results);
+    setBadge('completed', `${successCount}/${total} 成功`);
+  } catch (e) {
+    progressText.textContent = `批量生成失败: ${e.message}`;
+    setBadge('error', '失败');
+  } finally {
+    previewBtn.disabled = false;
+    generateBtn.disabled = false;
+  }
+}
+
+function updateTableWithResults(results) {
+  results.forEach((r) => {
+    const tr = document.getElementById(`row-${r.record_id}`);
+    if (!tr) return;
+
+    const cells = tr.querySelectorAll('td');
+    const statusCell = cells[5];
+    const noteCell = cells[6];
+
+    if (r.status === 'success') {
+      statusCell.innerHTML = '<span class="row-status success">成功</span>';
+      const parts = [];
+      if (r.queued_task_id) parts.push('已入队');
+      if (r.image_urls && r.image_urls.length) parts.push(`${r.image_urls.length}张晒图`);
+      noteCell.textContent = parts.join(', ') || '完成';
+    } else {
+      statusCell.innerHTML = '<span class="row-status error">失败</span>';
+      noteCell.innerHTML = `<span class="cell-error" title="${escapeHtml(r.error || '')}">${escapeHtml(r.error || '未知错误')}</span>`;
+    }
+  });
+}
+
+function setBadge(type, text) {
+  statusBadge.className = `status-badge ${type}`;
+  statusBadge.textContent = text;
+  statusBadge.classList.remove('hidden');
 }
 
 function escapeHtml(str) {
+  if (!str) return '';
   return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br>');
+    .replace(/"/g, '&quot;');
 }
-
-// ===== 图片附件管理 =====
-function attachImage(file) {
-  attachedFile = file;
-  const reader = new FileReader();
-  reader.onload = function (e) {
-    previewImg.src = e.target.result;
-    imagePreview.style.display = 'flex';
-  };
-  reader.readAsDataURL(file);
-}
-
-function removeImage() {
-  attachedFile = null;
-  previewImg.src = '';
-  imagePreview.style.display = 'none';
-  imageInput.value = '';
-}
-
-// ===== 统一发送（文字 / 文字+图片） =====
-async function sendMessage() {
-  const text = userInput.value.trim();
-  const hasImage = !!attachedFile;
-
-  // 至少要有文字或图片
-  if (!text && !hasImage) return;
-
-  // ---- 构建用户消息展示 ----
-  let userHtml = '';
-  if (hasImage) {
-    userHtml += `<img src="${previewImg.src}" class="preview-img" alt="商品白底图">`;
-    if (text) userHtml += '<br>';
-  }
-  if (text) {
-    userHtml += escapeHtml(text);
-  }
-  addMessage(userHtml, 'user');
-
-  // 清空输入区
-  const currentText = text;
-  const currentFile = attachedFile;
-  userInput.value = '';
-  userInput.style.height = 'auto';
-  removeImage();
-
-  // 禁用输入
-  setInputsDisabled(true);
-
-  try {
-    if (hasImage) {
-      // ===== 有图片：走合并接口 =====
-      showTyping('正在生成评价…');
-
-      const formData = new FormData();
-      formData.append('file', currentFile);
-      formData.append('user_input', currentText);
-
-      const resp = await fetch('/chat-with-image', {
-        method: 'POST',
-        body: formData
-      });
-
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-
-      removeTyping();
-
-      // 显示评价文字
-      if (data.reply) {
-        addMessage(escapeHtml(data.reply), 'bot');
-      }
-
-      // 显示晒图结果
-      if (data.image_result) {
-        let imgHtml = '';
-        const ir = data.image_result;
-
-        if (ir.status === 'success' || ir.status === 'partial') {
-          imgHtml += `<strong>${ir.message}</strong><br><br>`;
-
-          if (ir.prompts && ir.prompts.length > 0) {
-            imgHtml += '<strong>🎨 场景描述：</strong><br>';
-            ir.prompts.forEach((p, i) => {
-              imgHtml += `${i + 1}. ${escapeHtml(p)}<br>`;
-            });
-            imgHtml += '<br>';
-          }
-
-          if (ir.image_urls && ir.image_urls.length > 0) {
-            imgHtml += '<strong>🖼️ 生成的买家秀晒图：</strong><br>';
-            imgHtml += '<div class="generated-images">';
-            ir.image_urls.forEach((url, i) => {
-              imgHtml += `<img src="${url}" alt="场景${i + 1}" class="generated-img" loading="lazy">`;
-            });
-            imgHtml += '</div>';
-          }
-        } else {
-          imgHtml = `❌ ${ir.message || '晒图生成失败'}`;
-        }
-
-        addMessage(imgHtml, 'bot');
-      }
-
-    } else {
-      // ===== 纯文字：走原来的 /chat =====
-      showTyping('正在生成评价…');
-
-      const resp = await fetch('/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_input: currentText })
-      });
-
-      removeTyping();
-
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-
-      const reply = data.reply || '抱歉，生成失败了。';
-      addMessage(escapeHtml(reply), 'bot');
-    }
-
-  } catch (e) {
-    removeTyping();
-    addMessage('❌ 请求出错：' + e.message + '<br>可能是 API 过载，请等几秒再试。', 'bot');
-    console.error(e);
-  } finally {
-    setInputsDisabled(false);
-    userInput.focus();
-  }
-}
-
-// ===== 事件绑定 =====
-sendBtn.addEventListener('click', sendMessage);
-
-userInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-});
-
-// 自动调整输入框高度
-userInput.addEventListener('input', () => {
-  userInput.style.height = 'auto';
-  userInput.style.height = Math.min(userInput.scrollHeight, 120) + 'px';
-});
-
-// 📸 按钮：选择文件（不发送）
-uploadBtn.addEventListener('click', () => {
-  imageInput.click();
-});
-
-// 文件选中后：只显示预览，不发送
-imageInput.addEventListener('change', (e) => {
-  const file = e.target.files[0];
-  if (file) {
-    attachImage(file);
-  }
-});
-
-// 移除已附带的图片
-removeImgBtn.addEventListener('click', () => {
-  removeImage();
-});

@@ -4,57 +4,37 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>买家秀生成 Agent</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <title>买家秀批量生成</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 
 <body>
-  <div class="chat-container">
-    <header class="chat-header">
+  <div class="app-container">
+    <header class="app-header">
       <div class="header-icon">🛍️</div>
       <div>
-        <h1>买家秀智能生成 Agent</h1>
-        <p class="subtitle">输入商品信息生成评价 · 附带白底图一键生成晒图</p>
+        <h1>买家秀批量生成</h1>
+        <p class="subtitle">从飞书需求表读取 · 自动生成评价和晒图 · 入队微信发送</p>
       </div>
     </header>
 
-    <div id="chatLog" class="chat-log">
-      <div class="message bot">
-        <div class="msg-content">
-          👋 你好！我是买家秀生成 Agent。<br><br>
-          <strong>💬 纯文字：</strong>生成评价<br>
-          • <em>"帮我生成3条评价，商品：白色V领针织开衫"</em><br><br>
-          <strong>📸 文字 + 图片：</strong>生成评价 + 晒图<br>
-          • 先点 📸 附上商品白底图<br>
-          • 再在输入框填写指令（如上）<br>
-          • 最后点击发送按钮 ▶
-        </div>
-      </div>
+    <div class="toolbar">
+      <button id="previewBtn" class="btn btn-secondary">读取需求表</button>
+      <button id="generateBtn" class="btn btn-primary" disabled>开始批量生成</button>
+      <span id="statusBadge" class="status-badge hidden"></span>
     </div>
 
-    <div class="input-area">
-      <!-- 隐藏的文件 input -->
-      <input type="file" id="imageInput" accept="image/*" style="display: none;">
-
-      <!-- 图片预览区（选中图片后才显示） -->
-      <div id="imagePreview" class="image-preview" style="display: none;">
-        <img id="previewImg" src="" alt="预览">
-        <button id="removeImgBtn" class="remove-img-btn" title="移除图片">✕</button>
+    <div id="progressArea" class="progress-area hidden">
+      <div class="progress-bar-track">
+        <div id="progressBar" class="progress-bar-fill" style="width: 0%"></div>
       </div>
+      <p id="progressText" class="progress-text">准备中...</p>
+    </div>
 
-      <div class="input-row">
-        <!-- 上传按钮 -->
-        <button id="uploadBtn" class="upload-btn" title="附上商品白底图">📸</button>
-        <!-- 文字输入 -->
-        <textarea id="userInput" rows="1" placeholder="输入商品名称和评价数量，按 Enter 发送…"></textarea>
-        <!-- 发送按钮 -->
-        <button id="sendBtn">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-        </button>
+    <div id="tableArea" class="table-area">
+      <div class="empty-state">
+        <p>点击「读取需求表」从飞书加载商品列表</p>
       </div>
     </div>
   </div>

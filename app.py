@@ -1,17 +1,25 @@
 """
-V2.2 买家秀生成 Agent - Web 服务入口
+V3.0 买家秀生成 Agent - Web 服务入口
 
 能力：
-1. 文本/图片生成（保留）
+1. 文本/图片生成（保留旧接口）
 2. 发送任务入队（面向影刀）
 3. outbox 取单与回写接口（供影刀轮询）
+4. 批量生成：从飞书需求表读取，逐行生成评价+晒图并入队
 """
 from __future__ import annotations
+import sys
+import io
 import os
 import asyncio
 import json
 import logging
 from datetime import datetime, timezone
+
+if sys.stdout and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+if sys.stderr and hasattr(sys.stderr, "buffer"):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -42,9 +50,9 @@ logger = logging.getLogger("outbox-api")
 
 # ===== FastAPI 应用 =====
 app = FastAPI(
-    title="买家秀生成 Agent V2.1",
-    version="2.2",
-    description="输入商品链接或描述，生成评价和晒图，并入队给影刀发送。"
+    title="买家秀生成 Agent V3.0",
+    version="3.0",
+    description="从飞书需求表批量读取商品信息，生成评价和晒图，入队给影刀发送。"
 )
 
 # 挂载静态资源
@@ -510,6 +518,181 @@ def _append_heartbeat(data: Dict[str, Any]) -> None:
     }
     with open(HEARTBEAT_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# ===== 批量生成：从飞书需求表读取 =====
+
+_batch_status: Dict[str, Any] = {}
+
+
+def _get_feishu_reader():
+    from feishu_reader import fetch_all_source_rows, download_attachment  # pylint: disable=import-outside-toplevel
+    return fetch_all_source_rows, download_attachment
+
+
+@app.post("/batch-generate")
+async def batch_generate():
+    """
+    从飞书需求表读取所有行，逐行生成评价+晒图，写回旧表并入队微信发送。
+    """
+    batch_id = str(uuid4())[:8]
+    _batch_status[batch_id] = {
+        "status": "running",
+        "total": 0,
+        "processed": 0,
+        "results": [],
+    }
+
+    try:
+        fetch_all_source_rows, download_attachment_fn = _get_feishu_reader()
+        run_agent, run_image_generation = _get_generation_runners()
+
+        logger.info("[batch-%s] 开始读取飞书需求表...", batch_id)
+        feishu_token, rows = await asyncio.to_thread(fetch_all_source_rows)
+
+        if not rows:
+            _batch_status[batch_id]["status"] = "completed"
+            return JSONResponse(content={
+                "batch_id": batch_id,
+                "message": "需求表为空，没有可处理的行",
+                "total": 0,
+                "results": [],
+            })
+
+        _batch_status[batch_id]["total"] = len(rows)
+        logger.info("[batch-%s] 共读取 %d 条需求", batch_id, len(rows))
+
+        contacts = _parse_target_contacts(DEFAULT_TARGET_CONTACTS)
+        results: List[Dict[str, Any]] = []
+
+        for idx, row in enumerate(rows):
+            row_result: Dict[str, Any] = {
+                "index": idx + 1,
+                "record_id": row.record_id,
+                "product_title": row.product_title,
+                "review_count": row.review_count,
+                "image_count": row.image_count,
+                "status": "pending",
+                "review_text": "",
+                "image_urls": [],
+                "error": None,
+                "queued_task_id": None,
+            }
+
+            try:
+                logger.info(
+                    "[batch-%s] [%d/%d] 处理: %s (评价%d条, 晒图%d组)",
+                    batch_id, idx + 1, len(rows),
+                    row.product_title, row.review_count, row.image_count,
+                )
+
+                # 1) 生成评价
+                user_prompt = f"帮我生成{row.review_count}条评价，商品：{row.product_title}"
+                review_text = await asyncio.to_thread(run_agent, user_prompt)
+                row_result["review_text"] = review_text
+
+                # 2) 下载平铺图并生成晒图
+                image_result = None
+                local_images: List[str] = []
+                if row.image_file_tokens:
+                    image_bytes = await asyncio.to_thread(
+                        download_attachment_fn, feishu_token, row.image_file_tokens[0]
+                    )
+                    if image_bytes and len(image_bytes) > 100:
+                        image_result = await asyncio.to_thread(
+                            run_image_generation,
+                            image_bytes,
+                            row.product_title,
+                            row.image_count,
+                        )
+                        local_images = _materialize_generated_images(image_result)
+                        row_result["image_urls"] = (
+                            image_result.get("image_urls", []) if image_result else []
+                        )
+
+                # 3) 入队微信发送
+                if contacts:
+                    task = enqueue_task(
+                        db_path=OUTBOX_DB_PATH,
+                        target_contacts=contacts,
+                        review_text=review_text,
+                        image_paths=local_images,
+                        file_paths=[],
+                        max_retry=4,
+                    )
+                    row_result["queued_task_id"] = task.task_id
+
+                row_result["status"] = "success"
+                logger.info(
+                    "[batch-%s] [%d/%d] 完成: %s",
+                    batch_id, idx + 1, len(rows), row.product_title,
+                )
+
+            except Exception as e:
+                row_result["status"] = "error"
+                row_result["error"] = str(e)
+                logger.exception(
+                    "[batch-%s] [%d/%d] 失败: %s",
+                    batch_id, idx + 1, len(rows), row.product_title,
+                )
+
+            results.append(row_result)
+            _batch_status[batch_id]["processed"] = idx + 1
+            _batch_status[batch_id]["results"] = results
+
+        success_count = sum(1 for r in results if r["status"] == "success")
+        _batch_status[batch_id]["status"] = "completed"
+
+        return JSONResponse(content={
+            "batch_id": batch_id,
+            "message": f"批量处理完成：{success_count}/{len(rows)} 成功",
+            "total": len(rows),
+            "success_count": success_count,
+            "results": results,
+        })
+
+    except Exception as e:
+        logger.exception("[batch-%s] 批量生成异常", batch_id)
+        _batch_status[batch_id]["status"] = "error"
+        _batch_status[batch_id]["error"] = str(e)
+        return JSONResponse(
+            content={"batch_id": batch_id, "error": str(e)},
+            status_code=500,
+        )
+
+
+@app.get("/batch-generate/status")
+async def batch_generate_status(batch_id: str = Query(default="")):
+    """查询批量生成进度"""
+    if not batch_id or batch_id not in _batch_status:
+        return JSONResponse(content={"error": "batch_id not found"}, status_code=404)
+    return JSONResponse(content={"batch_id": batch_id, **_batch_status[batch_id]})
+
+
+@app.get("/batch-generate/preview")
+async def batch_generate_preview():
+    """
+    只读取飞书需求表，返回所有行的预览（不触发生成）。
+    """
+    try:
+        fetch_all_source_rows, _ = _get_feishu_reader()
+        _, rows = await asyncio.to_thread(fetch_all_source_rows)
+        return JSONResponse(content={
+            "total": len(rows),
+            "rows": [
+                {
+                    "record_id": r.record_id,
+                    "product_title": r.product_title,
+                    "has_image": len(r.image_file_tokens) > 0,
+                    "review_count": r.review_count,
+                    "image_count": r.image_count,
+                }
+                for r in rows
+            ],
+        })
+    except Exception as e:
+        logger.exception("预览飞书需求表失败")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":
