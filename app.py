@@ -526,8 +526,12 @@ _batch_status: Dict[str, Any] = {}
 
 
 def _get_feishu_reader():
-    from feishu_reader import fetch_all_source_rows, download_attachment  # pylint: disable=import-outside-toplevel
-    return fetch_all_source_rows, download_attachment
+    from feishu_reader import (  # pylint: disable=import-outside-toplevel
+        fetch_all_source_rows,
+        download_attachment,
+        update_source_row_status,
+    )
+    return fetch_all_source_rows, download_attachment, update_source_row_status
 
 
 @app.post("/batch-generate")
@@ -544,7 +548,7 @@ async def batch_generate():
     }
 
     try:
-        fetch_all_source_rows, download_attachment_fn = _get_feishu_reader()
+        fetch_all_source_rows, download_attachment_fn, update_source_row_status_fn = _get_feishu_reader()
         run_agent, run_image_generation = _get_generation_runners()
 
         logger.info("[batch-%s] 开始读取飞书需求表...", batch_id)
@@ -559,30 +563,47 @@ async def batch_generate():
                 "results": [],
             })
 
-        _batch_status[batch_id]["total"] = len(rows)
-        logger.info("[batch-%s] 共读取 %d 条需求", batch_id, len(rows))
+        process_rows = [row for row in rows if row.should_process]
+        skipped_rows = [row for row in rows if not row.should_process]
+        _batch_status[batch_id]["total"] = len(process_rows)
+        logger.info(
+            "[batch-%s] 共读取 %d 条需求，可处理 %d 条，已处理跳过 %d 条",
+            batch_id, len(rows), len(process_rows), len(skipped_rows)
+        )
+
+        if not process_rows:
+            _batch_status[batch_id]["status"] = "completed"
+            return JSONResponse(content={
+                "batch_id": batch_id,
+                "message": "没有待处理需求（处理状态均为已处理）",
+                "total": 0,
+                "skipped_count": len(skipped_rows),
+                "results": [],
+            })
 
         contacts = _parse_target_contacts(DEFAULT_TARGET_CONTACTS)
         results: List[Dict[str, Any]] = []
 
-        for idx, row in enumerate(rows):
+        for idx, row in enumerate(process_rows):
             row_result: Dict[str, Any] = {
                 "index": idx + 1,
                 "record_id": row.record_id,
                 "product_title": row.product_title,
                 "review_count": row.review_count,
                 "image_count": row.image_count,
+                "processing_status_before": row.processing_status,
                 "status": "pending",
                 "review_text": "",
                 "image_urls": [],
                 "error": None,
                 "queued_task_id": None,
+                "processing_status_updated": False,
             }
 
             try:
                 logger.info(
                     "[batch-%s] [%d/%d] 处理: %s (评价%d条, 晒图%d组)",
-                    batch_id, idx + 1, len(rows),
+                    batch_id, idx + 1, len(process_rows),
                     row.product_title, row.review_count, row.image_count,
                 )
 
@@ -622,10 +643,18 @@ async def batch_generate():
                     )
                     row_result["queued_task_id"] = task.task_id
 
+                # 4) 回写源表状态为“已处理”，避免下一批重复处理
+                await asyncio.to_thread(
+                    update_source_row_status_fn,
+                    feishu_token,
+                    row.record_id,
+                    "已处理",
+                )
+                row_result["processing_status_updated"] = True
                 row_result["status"] = "success"
                 logger.info(
                     "[batch-%s] [%d/%d] 完成: %s",
-                    batch_id, idx + 1, len(rows), row.product_title,
+                    batch_id, idx + 1, len(process_rows), row.product_title,
                 )
 
             except Exception as e:
@@ -633,7 +662,7 @@ async def batch_generate():
                 row_result["error"] = str(e)
                 logger.exception(
                     "[batch-%s] [%d/%d] 失败: %s",
-                    batch_id, idx + 1, len(rows), row.product_title,
+                    batch_id, idx + 1, len(process_rows), row.product_title,
                 )
 
             results.append(row_result)
@@ -645,9 +674,10 @@ async def batch_generate():
 
         return JSONResponse(content={
             "batch_id": batch_id,
-            "message": f"批量处理完成：{success_count}/{len(rows)} 成功",
-            "total": len(rows),
+            "message": f"批量处理完成：{success_count}/{len(process_rows)} 成功（跳过已处理 {len(skipped_rows)} 条）",
+            "total": len(process_rows),
             "success_count": success_count,
+            "skipped_count": len(skipped_rows),
             "results": results,
         })
 
@@ -675,10 +705,11 @@ async def batch_generate_preview():
     只读取飞书需求表，返回所有行的预览（不触发生成）。
     """
     try:
-        fetch_all_source_rows, _ = _get_feishu_reader()
+        fetch_all_source_rows, _, _ = _get_feishu_reader()
         _, rows = await asyncio.to_thread(fetch_all_source_rows)
         return JSONResponse(content={
             "total": len(rows),
+            "processable_total": sum(1 for r in rows if r.should_process),
             "rows": [
                 {
                     "record_id": r.record_id,
@@ -686,6 +717,8 @@ async def batch_generate_preview():
                     "has_image": len(r.image_file_tokens) > 0,
                     "review_count": r.review_count,
                     "image_count": r.image_count,
+                    "processing_status": r.processing_status,
+                    "should_process": r.should_process,
                 }
                 for r in rows
             ],

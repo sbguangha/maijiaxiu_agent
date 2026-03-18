@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 logs/
 .DS_Store
+
+# Runtime data artifacts
+data/outbox.db
+data/generated_images/
+data/outbox_files/
+data/test_materials/
+output/

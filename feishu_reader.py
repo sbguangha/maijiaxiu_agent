@@ -33,6 +33,8 @@ class SourceRow:
     image_file_tokens: list[str]
     review_count: int
     image_count: int
+    processing_status: str
+    should_process: bool
 
 
 def get_tenant_access_token() -> str:
@@ -115,6 +117,8 @@ def parse_source_row(record: dict) -> SourceRow | None:
 
     review_count = _parse_int(fields.get("评价数量"), default=5)
     image_count = _parse_int(fields.get("晒图数量"), default=2)
+    processing_status = _parse_status_text(fields.get("处理状态"))
+    should_process = _is_todo_status(processing_status)
 
     return SourceRow(
         record_id=record_id,
@@ -122,6 +126,8 @@ def parse_source_row(record: dict) -> SourceRow | None:
         image_file_tokens=image_file_tokens,
         review_count=review_count,
         image_count=image_count,
+        processing_status=processing_status,
+        should_process=should_process,
     )
 
 
@@ -165,6 +171,44 @@ def fetch_all_source_rows(
     return token, rows
 
 
+def update_source_row_status(
+    token: str,
+    record_id: str,
+    status_value: str = "已处理",
+    app_token: str | None = None,
+    table_id: str | None = None,
+) -> None:
+    """
+    更新需求表某行的“处理状态”字段。
+    """
+    app_token = app_token or os.getenv("FEISHU_SOURCE_APP_TOKEN", "")
+    table_id = table_id or os.getenv("FEISHU_SOURCE_TABLE_ID", "")
+    if not app_token or not table_id:
+        raise RuntimeError("FEISHU_SOURCE_APP_TOKEN / FEISHU_SOURCE_TABLE_ID 未配置")
+    if not record_id:
+        raise RuntimeError("record_id 不能为空")
+
+    url = f"{_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+    # 兼容文本字段与单选字段两种常见建模方式。
+    candidates = [
+        {"fields": {"处理状态": status_value}},
+        {"fields": {"处理状态": [{"text": status_value}]}},
+    ]
+    last_resp = None
+    for payload in candidates:
+        resp = requests.put(url, headers=headers, json=payload, timeout=20)
+        data = resp.json()
+        last_resp = data
+        if data.get("code") == 0:
+            return
+    raise RuntimeError(f"更新处理状态失败: {last_resp}")
+
+
 def _parse_int(value, default: int = 0) -> int:
     if value is None:
         return default
@@ -176,3 +220,41 @@ def _parse_int(value, default: int = 0) -> int:
         except (ValueError, TypeError):
             return default
     return default
+
+
+def _parse_status_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("text", "name", "value"):
+            val = value.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                for key in ("text", "name", "value"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        parts.append(val.strip())
+                        break
+        return " ".join(parts).strip()
+    return str(value).strip()
+
+
+def _is_todo_status(status_text: str) -> bool:
+    normalized = (status_text or "").strip().replace(" ", "")
+    if not normalized:
+        return True
+    if normalized in {"已处理", "完成", "completed", "done"}:
+        return False
+    if normalized in {"待处理", "未处理", "pending", "todo"}:
+        return True
+    # 未知状态默认纳入处理，避免误漏单
+    return True
