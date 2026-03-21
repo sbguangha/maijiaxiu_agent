@@ -55,6 +55,12 @@ function renderPreviewTable(rows) {
   </tr></thead><tbody>`;
 
   rows.forEach((row, i) => {
+    const statusText = (row.processing_status || '').trim();
+    const shouldProcess = !!row.should_process;
+    const uiStatusText = shouldProcess ? (statusText || '待处理') : (statusText || '已处理');
+    const statusClass = shouldProcess ? 'pending' : 'success';
+    const noteText = shouldProcess ? '' : '本轮将跳过';
+
     html += `<tr id="row-${row.record_id}">
       <td>${i + 1}</td>
       <td class="cell-title" title="${escapeHtml(row.product_title)}">${escapeHtml(row.product_title)}</td>
@@ -63,8 +69,8 @@ function renderPreviewTable(rows) {
         : '<span class="has-image-no">无</span>'}</td>
       <td>${row.review_count}</td>
       <td>${row.image_count}</td>
-      <td><span class="row-status pending">待处理</span></td>
-      <td></td>
+      <td><span class="row-status ${statusClass}">${escapeHtml(uiStatusText)}</span></td>
+      <td>${escapeHtml(noteText)}</td>
     </tr>`;
   });
 
