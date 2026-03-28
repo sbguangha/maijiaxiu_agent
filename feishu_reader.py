@@ -33,6 +33,7 @@ class SourceRow:
     image_file_tokens: list[str]
     review_count: int
     image_count: int
+    wechat_contacts: list[str]
     processing_status: str
     should_process: bool
 
@@ -117,6 +118,7 @@ def parse_source_row(record: dict) -> SourceRow | None:
 
     review_count = _parse_int(fields.get("评价数量"), default=5)
     image_count = _parse_int(fields.get("晒图数量"), default=2)
+    wechat_contacts = _parse_wechat_contacts(fields.get("微信联系人"))
     processing_status = _parse_status_text(fields.get("处理状态"))
     should_process = _is_todo_status(processing_status)
 
@@ -126,6 +128,7 @@ def parse_source_row(record: dict) -> SourceRow | None:
         image_file_tokens=image_file_tokens,
         review_count=review_count,
         image_count=image_count,
+        wechat_contacts=wechat_contacts,
         processing_status=processing_status,
         should_process=should_process,
     )
@@ -258,3 +261,51 @@ def _is_todo_status(status_text: str) -> bool:
         return True
     # 未知状态默认纳入处理，避免误漏单
     return True
+
+
+def _parse_wechat_contacts(value) -> list[str]:
+    """
+    解析需求表中的“微信联系人”字段，支持：
+    - 文本：张三,李四
+    - 多行文本：每行一个
+    - 列表/对象：提取 text/name/value
+    """
+    raw_parts: list[str] = []
+
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        raw_parts.append(value)
+    elif isinstance(value, dict):
+        for key in ("text", "name", "value"):
+            val = value.get(key)
+            if isinstance(val, str) and val.strip():
+                raw_parts.append(val)
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                raw_parts.append(item)
+            elif isinstance(item, dict):
+                for key in ("text", "name", "value"):
+                    val = item.get(key)
+                    if isinstance(val, str) and val.strip():
+                        raw_parts.append(val)
+                        break
+
+    contacts: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        normalized = (
+            part.replace("，", ",")
+            .replace("\n", ",")
+            .replace(";", ",")
+            .replace("；", ",")
+        )
+        for name in normalized.split(","):
+            name = name.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            contacts.append(name)
+    return contacts

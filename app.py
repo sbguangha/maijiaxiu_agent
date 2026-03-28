@@ -25,7 +25,7 @@ from uuid import uuid4
 
 import requests
 from fastapi import FastAPI, Request, UploadFile, File, Form, Query
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -40,6 +40,11 @@ from outbox import (
     list_tasks,
     requeue_dead_letter,
     recover_processing_task,
+    create_delivery_approval as db_create_approval,
+    get_delivery_approval as db_get_approval,
+    list_delivery_approvals as db_list_approvals,
+    confirm_delivery_approval as db_confirm_approval,
+    reject_delivery_approval as db_reject_approval,
 )
 import uvicorn
 
@@ -63,6 +68,23 @@ GENERATED_IMAGE_DIR = os.getenv("GENERATED_IMAGE_DIR", os.path.join(BASE_DIR, "d
 OUTBOX_FILE_DIR = os.getenv("OUTBOX_FILE_DIR", os.path.join(BASE_DIR, "data", "outbox_files"))
 DEFAULT_TARGET_CONTACTS = os.getenv("WECHAT_TARGET_CONTACTS", os.getenv("WECHAT_TARGET_CONTACT", ""))
 HEARTBEAT_FILE = os.getenv("OUTBOX_HEARTBEAT_FILE", os.path.join(BASE_DIR, "logs", "outbox_heartbeat.jsonl"))
+
+
+def _parse_env_bool(raw: str, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+REQUIRE_DELIVERY_CONFIRMATION = _parse_env_bool(
+    os.getenv("REQUIRE_DELIVERY_CONFIRMATION", "false"),
+    default=False,
+)
 
 
 @app.on_event("startup")
@@ -116,12 +138,25 @@ class OutboxEnqueueRequest(BaseModel):
     max_retry: int = Field(default=4, ge=1, le=10)
 
 
+class DeliveryApprovalActionRequest(BaseModel):
+    note: str = Field(default="", description="确认/驳回备注")
+
+
 # ===== 根路径：返回聊天页面 =====
 @app.get("/", response_class=HTMLResponse)
 async def root():
     index_path = os.path.join(BASE_DIR, "static", "index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+@app.get("/generated-images/{filename}")
+async def serve_generated_image(filename: str):
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(GENERATED_IMAGE_DIR, safe_name)
+    if not os.path.isfile(file_path):
+        return JSONResponse(content={"error": "not found"}, status_code=404)
+    return FileResponse(file_path, media_type="image/jpeg")
 
 
 # ===== 纯文字聊天 API =====
@@ -183,6 +218,7 @@ async def chat_with_image(
             )
 
         queue_result = None
+        approval_result = None
         file_paths: List[str] = []
         if table_file is not None:
             file_paths.extend(await _save_uploaded_files([table_file], prefix="table"))
@@ -195,23 +231,38 @@ async def chat_with_image(
         local_images = _materialize_generated_images(image_result)
 
         if enqueue_for_delivery and contacts:
-            task = enqueue_task(
-                db_path=OUTBOX_DB_PATH,
-                target_contacts=contacts,
-                review_text=review_text,
-                image_paths=local_images,
-                file_paths=file_paths,
-                max_retry=4,
-            )
-            queue_result = _task_to_dict(task)
+            if REQUIRE_DELIVERY_CONFIRMATION:
+                approval_result = _create_delivery_approval(
+                    source="chat-with-image",
+                    product_title=_extract_product_name(user_input) or "未命名商品",
+                    target_contacts=contacts,
+                    review_text=review_text,
+                    image_paths=local_images,
+                    file_paths=file_paths,
+                    max_retry=4,
+                )
+            else:
+                task = enqueue_task(
+                    db_path=OUTBOX_DB_PATH,
+                    target_contacts=contacts,
+                    review_text=review_text,
+                    image_paths=local_images,
+                    file_paths=file_paths,
+                    max_retry=4,
+                )
+                queue_result = _task_to_dict(task)
 
         return JSONResponse(content={
             "reply": review_text,
             "image_result": image_result,
             "queue_result": queue_result,
             "queue_message": (
-                "已加入发送队列" if queue_result else "未入队：未提供 target_contacts"
+                "待人工确认后发送"
+                if approval_result
+                else ("已加入发送队列" if queue_result else "未入队：未提供 target_contacts")
             ),
+            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+            "approval_result": approval_result,
             "materialized_images": local_images,
             "materialized_files": file_paths,
         })
@@ -338,6 +389,31 @@ def _task_to_dict(task) -> Dict[str, Any]:
     }
 
 
+def _create_delivery_approval(
+    *,
+    source: str,
+    product_title: str,
+    target_contacts: List[str],
+    review_text: str,
+    image_paths: List[str],
+    file_paths: List[str],
+    max_retry: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    approval = db_create_approval(
+        OUTBOX_DB_PATH,
+        source=source,
+        product_title=product_title,
+        target_contacts=target_contacts,
+        review_text=review_text,
+        image_paths=image_paths,
+        file_paths=file_paths,
+        max_retry=max_retry,
+        extra=extra,
+    )
+    return approval.to_dict()
+
+
 @app.get("/outbox/tasks")
 async def get_outbox_tasks(
     limit: int = Query(default=50, ge=1, le=200),
@@ -367,6 +443,82 @@ async def post_outbox_enqueue(payload: OutboxEnqueueRequest):
             max_retry=payload.max_retry,
         )
         return JSONResponse(content={"task": _task_to_dict(task)})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+
+
+@app.get("/delivery-approvals")
+async def list_delivery_approvals(
+    status: str = Query(default="pending"),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    try:
+        normalized_status = (status or "").strip().lower() or "pending"
+        items = db_list_approvals(OUTBOX_DB_PATH, status=normalized_status, limit=limit)
+        return JSONResponse(
+            content={
+                "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+                "count": len(items),
+                "approvals": [a.to_dict() for a in items],
+            }
+        )
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/delivery-approvals/{approval_id}/confirm")
+async def confirm_delivery_approval(
+    approval_id: str,
+    payload: Optional[DeliveryApprovalActionRequest] = None,
+):
+    try:
+        existing = db_get_approval(OUTBOX_DB_PATH, approval_id)
+        if not existing:
+            return JSONResponse(content={"error": "approval_not_found"}, status_code=404)
+        if existing.status == "rejected":
+            return JSONResponse(content={"error": "approval_already_rejected"}, status_code=400)
+        if existing.queued_task_id and existing.queued_task_id != "__pending_enqueue__":
+            return JSONResponse(content={"approval": existing.to_dict(), "message": "already_confirmed"})
+
+        note = payload.note if payload else ""
+        updated = db_confirm_approval(OUTBOX_DB_PATH, approval_id, note=note)
+        if not updated:
+            return JSONResponse(content={"error": "confirm_failed"}, status_code=500)
+
+        task_dict = None
+        if updated.queued_task_id:
+            tasks = list_tasks(OUTBOX_DB_PATH, limit=1, status=None)
+            matched = next((t for t in tasks if t.task_id == updated.queued_task_id), None)
+            if matched:
+                task_dict = _task_to_dict(matched)
+
+        return JSONResponse(content={
+            "approval": updated.to_dict(),
+            "task": task_dict,
+            "message": "queued",
+        })
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+
+
+@app.post("/delivery-approvals/{approval_id}/reject")
+async def reject_delivery_approval(
+    approval_id: str,
+    payload: Optional[DeliveryApprovalActionRequest] = None,
+):
+    try:
+        existing = db_get_approval(OUTBOX_DB_PATH, approval_id)
+        if not existing:
+            return JSONResponse(content={"error": "approval_not_found"}, status_code=404)
+        if existing.queued_task_id and existing.queued_task_id != "__pending_enqueue__":
+            return JSONResponse(content={"error": "approval_already_confirmed"}, status_code=400)
+
+        note = payload.note if payload else ""
+        updated = db_reject_approval(OUTBOX_DB_PATH, approval_id, note=note)
+        if not updated:
+            return JSONResponse(content={"error": "reject_failed"}, status_code=500)
+
+        return JSONResponse(content={"approval": updated.to_dict(), "message": "rejected"})
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
 
@@ -581,7 +733,7 @@ async def batch_generate():
                 "results": [],
             })
 
-        contacts = _parse_target_contacts(DEFAULT_TARGET_CONTACTS)
+        default_contacts = _parse_target_contacts(DEFAULT_TARGET_CONTACTS)
         results: List[Dict[str, Any]] = []
 
         for idx, row in enumerate(process_rows):
@@ -591,12 +743,14 @@ async def batch_generate():
                 "product_title": row.product_title,
                 "review_count": row.review_count,
                 "image_count": row.image_count,
+                "target_contacts": row.wechat_contacts or default_contacts,
                 "processing_status_before": row.processing_status,
                 "status": "pending",
                 "review_text": "",
                 "image_urls": [],
                 "error": None,
                 "queued_task_id": None,
+                "approval_id": None,
                 "processing_status_updated": False,
             }
 
@@ -632,16 +786,36 @@ async def batch_generate():
                         )
 
                 # 3) 入队微信发送
-                if contacts:
-                    task = enqueue_task(
-                        db_path=OUTBOX_DB_PATH,
-                        target_contacts=contacts,
-                        review_text=review_text,
-                        image_paths=local_images,
-                        file_paths=[],
-                        max_retry=4,
-                    )
-                    row_result["queued_task_id"] = task.task_id
+                row_contacts = row.wechat_contacts or default_contacts
+                row_result["target_contacts"] = row_contacts
+                if row_contacts:
+                    if REQUIRE_DELIVERY_CONFIRMATION:
+                        approval = _create_delivery_approval(
+                            source="batch-generate",
+                            product_title=row.product_title,
+                            target_contacts=row_contacts,
+                            review_text=review_text,
+                            image_paths=local_images,
+                            file_paths=[],
+                            max_retry=4,
+                            extra={
+                                "batch_id": batch_id,
+                                "record_id": row.record_id,
+                                "review_count": row.review_count,
+                                "image_count": row.image_count,
+                            },
+                        )
+                        row_result["approval_id"] = approval["approval_id"]
+                    else:
+                        task = enqueue_task(
+                            db_path=OUTBOX_DB_PATH,
+                            target_contacts=row_contacts,
+                            review_text=review_text,
+                            image_paths=local_images,
+                            file_paths=[],
+                            max_retry=4,
+                        )
+                        row_result["queued_task_id"] = task.task_id
 
                 # 4) 回写源表状态为“已处理”，避免下一批重复处理
                 await asyncio.to_thread(
@@ -678,6 +852,7 @@ async def batch_generate():
             "total": len(process_rows),
             "success_count": success_count,
             "skipped_count": len(skipped_rows),
+            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
             "results": results,
         })
 
@@ -708,6 +883,7 @@ async def batch_generate_preview():
         fetch_all_source_rows, _, _ = _get_feishu_reader()
         _, rows = await asyncio.to_thread(fetch_all_source_rows)
         return JSONResponse(content={
+            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
             "total": len(rows),
             "processable_total": sum(1 for r in rows if r.should_process),
             "rows": [
@@ -717,6 +893,7 @@ async def batch_generate_preview():
                     "has_image": len(r.image_file_tokens) > 0,
                     "review_count": r.review_count,
                     "image_count": r.image_count,
+                    "wechat_contacts": r.wechat_contacts,
                     "processing_status": r.processing_status,
                     "should_process": r.should_process,
                 }
