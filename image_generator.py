@@ -17,7 +17,6 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from PIL import Image
 
 load_dotenv()
 
@@ -41,7 +40,7 @@ _llm = ChatOpenAI(
 
 
 # ========== 1. 生成场景 Prompt ==========
-def generate_scene_prompts(product_name: str, scene_count: int = 2, color_hint: str = "") -> list[str]:
+def generate_scene_prompts(product_name: str, scene_count: int = 2) -> list[str]:
     """
     调用 Kimi，根据商品名称生成 N 个适合 doubao-seedream 的图生图 Prompt。
     每个 Prompt 描述一个不同的买家秀生活场景。
@@ -58,14 +57,13 @@ def generate_scene_prompts(product_name: str, scene_count: int = 2, color_hint: 
 5. 每个 Prompt 以"一个穿着该商品的"开头，确保商品是画面主角
 6. Prompt 长度控制在 30-80 个字之间
 7. 只输出 Prompt 列表，每行一个，用数字序号开头（如 1. 2. 3.）
-8. 不要输出任何其他解释文字"""),
+8. 人物默认设定为中国年轻人或普通中国消费者，面部特征自然，避免欧美模特感
+9. 不要输出任何其他解释文字"""),
         ("user", """商品名称：{product_name}
-商品主色：{color_hint}
 
 请生成 {scene_count} 个不同生活场景的图生图 Prompt，并且每条都必须包含以下硬性约束（可自然融入句子）：
-- 保持与输入商品图一致：服装颜色、版型、图案、领型、袖型、长度不得改变
-- 仅改变拍摄场景与人物姿态，不改变服装本体
-- 禁止把深色改成浅色、禁止把浅色改成深色""")
+- 保持衣服颜色和参考图一致
+- 人物使用中国人特征，长相自然，避免外国人或欧美模特特征""")
     ])
 
     chain = prompt | _llm | StrOutputParser()
@@ -77,7 +75,6 @@ def generate_scene_prompts(product_name: str, scene_count: int = 2, color_hint: 
             result = chain.invoke({
                 "product_name": product_name,
                 "scene_count": scene_count,
-                "color_hint": color_hint or "未知（请保持与输入图一致）",
             })
             break  # 成功就跳出循环
         except Exception as e:
@@ -299,9 +296,7 @@ def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int
 
     # Step 2: Kimi 生成场景 Prompt
     print(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
-    color_hint = detect_primary_color_name(image_bytes)
-    print(f"🎯 识别商品主色: {color_hint}")
-    prompts = generate_scene_prompts(product_name, scene_count, color_hint=color_hint)
+    prompts = generate_scene_prompts(product_name, scene_count)
     result["prompts"] = prompts
 
     if not prompts:
@@ -318,8 +313,8 @@ def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int
         # 调用 doubao 图生图（传 base64）
         strict_prompt = (
             f"{prompt}。"
-            f"必须严格保持商品颜色为{color_hint}，并与输入商品图颜色、版型、图案、领型、袖型一致。"
-            f"禁止改色，禁止改款，仅改变人物姿态和拍摄环境。"
+            f"保持衣服颜色和参考图一致。"
+            f"人物为中国人特征，面部自然，避免外国人或欧美模特感。"
         )
         gen_url = generate_lifestyle_image(strict_prompt, product_image_base64)
         if gen_url:
@@ -351,48 +346,3 @@ def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int
 
     return result
 
-
-def detect_primary_color_name(image_bytes: bytes) -> str:
-    """
-    从输入商品图估算主色，给 prompt 提供颜色约束。
-    """
-    try:
-        from io import BytesIO
-        img = Image.open(BytesIO(image_bytes)).convert("RGB")
-        # 缩小后统计平均色，降低噪声影响
-        small = img.resize((64, 64))
-        pixels = list(small.getdata())
-        if not pixels:
-            return "原图主色"
-        r = sum(p[0] for p in pixels) // len(pixels)
-        g = sum(p[1] for p in pixels) // len(pixels)
-        b = sum(p[2] for p in pixels) // len(pixels)
-        return _rgb_to_color_name(r, g, b)
-    except Exception:
-        return "原图主色"
-
-
-def _rgb_to_color_name(r: int, g: int, b: int) -> str:
-    max_c = max(r, g, b)
-    min_c = min(r, g, b)
-    diff = max_c - min_c
-    brightness = (r + g + b) / 3
-
-    if brightness < 55:
-        return "黑色"
-    if brightness > 220 and diff < 18:
-        return "白色"
-    if diff < 18:
-        if brightness < 95:
-            return "深灰色"
-        if brightness < 180:
-            return "灰色"
-        return "浅灰色"
-
-    if r >= g and r >= b:
-        if g > b + 20:
-            return "棕色"
-        return "红色"
-    if g >= r and g >= b:
-        return "绿色"
-    return "蓝色"
