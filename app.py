@@ -14,6 +14,7 @@ import os
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 if sys.stdout and hasattr(sys.stdout, "buffer"):
@@ -205,7 +206,8 @@ async def chat_with_image(
         review_text = ""
         if user_input.strip():
             print(f"📝 正在生成评价: {user_input[:50]}...")
-            review_text = await asyncio.to_thread(run_agent, user_input)
+            raw_review_text = await asyncio.to_thread(run_agent, user_input)
+            review_text = _format_review_text_for_delivery(raw_review_text)
 
         # ===== 第二步：生成晒图 =====
         image_result = None
@@ -293,6 +295,71 @@ def _extract_product_name(user_input: str) -> str:
     # 去掉常见指令词，剩余部分当商品名
     cleaned = re.sub(r'(帮我|请|生成|写|条评价|条评论|评价|评论|\d+条?|[，,。！])', '', user_input).strip()
     return cleaned if cleaned else ""
+
+
+def _normalize_review_block(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^\s*[-*]\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    return " ".join(lines).strip()
+
+
+def _format_review_text_for_delivery(raw_text: str) -> str:
+    """
+    统一微信发送文案格式：
+    仅保留评价正文，每条之间用分隔线连接，并在末尾追加分隔线。
+    """
+    text = (raw_text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+
+    blocks: List[str] = []
+
+    # 1) 按“评价X”分段，优先提取“内容：...”
+    sections = re.split(r"(?:^|\n)\s*(?:\d+\.\s*)?(?:\*\*)?评价\s*\d+(?:\*\*)?\s*[：:]\s*", text)
+    if len(sections) > 1:
+        for section in sections[1:]:
+            m = re.search(
+                r"(?:^|\n)\s*(?:[-*]\s*)?(?:内容|正文)\s*[：:]\s*(.+?)(?=\n\s*(?:[-*]\s*)?(?:配图建议|图片建议)\s*[：:]|\Z)",
+                section,
+                flags=re.S,
+            )
+            candidate = m.group(1) if m else section
+            normalized = _normalize_review_block(candidate)
+            if normalized:
+                blocks.append(normalized)
+
+    # 2) 兜底：直接抓取所有“内容：...”
+    if not blocks:
+        for m in re.finditer(
+            r"(?:^|\n)\s*(?:[-*]\s*)?(?:内容|正文)\s*[：:]\s*(.+?)(?=\n\s*(?:[-*]\s*)?(?:配图建议|图片建议|评价\s*\d+)\s*[：:]|\Z)",
+            text,
+            flags=re.S,
+        ):
+            normalized = _normalize_review_block(m.group(1))
+            if normalized:
+                blocks.append(normalized)
+
+    # 3) 最后兜底：移除说明行后按段落拆
+    if not blocks:
+        kept_lines: List[str] = []
+        for line in text.splitlines():
+            if re.search(r"(以下是为您生成|配图建议|这些评价|评价\s*\d+)", line):
+                continue
+            kept_lines.append(line)
+        fallback = "\n".join(kept_lines).strip()
+        parts = [p.strip() for p in re.split(r"\n\s*\n", fallback) if p.strip()]
+        blocks = [_normalize_review_block(p) for p in parts if _normalize_review_block(p)]
+
+    if not blocks:
+        return text
+
+    sep = "\n—————————————\n"
+    return sep.join(blocks) + "\n—————————————"
 
 
 def _parse_target_contacts(raw: str) -> List[str]:
@@ -763,7 +830,8 @@ async def batch_generate():
 
                 # 1) 生成评价
                 user_prompt = f"帮我生成{row.review_count}条评价，商品：{row.product_title}"
-                review_text = await asyncio.to_thread(run_agent, user_prompt)
+                raw_review_text = await asyncio.to_thread(run_agent, user_prompt)
+                review_text = _format_review_text_for_delivery(raw_review_text)
                 row_result["review_text"] = review_text
 
                 # 2) 下载平铺图并生成晒图
