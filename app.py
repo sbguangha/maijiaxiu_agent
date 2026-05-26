@@ -811,10 +811,13 @@ async def batch_generate():
                 "review_count": row.review_count,
                 "image_count": row.image_count,
                 "target_contacts": row.wechat_contacts or default_contacts,
+                "outfit_image_count": len(row.outfit_image_file_tokens),
                 "processing_status_before": row.processing_status,
                 "status": "pending",
                 "review_text": "",
                 "image_urls": [],
+                "image_reference_mode": "",
+                "image_reference_fields": [],
                 "error": None,
                 "queued_task_id": None,
                 "approval_id": None,
@@ -842,15 +845,30 @@ async def batch_generate():
                         download_attachment_fn, feishu_token, row.image_file_tokens[0]
                     )
                     if image_bytes and len(image_bytes) > 100:
+                        outfit_image_bytes_list: List[bytes] = []
+                        for outfit_token in row.outfit_image_file_tokens:
+                            outfit_bytes = await asyncio.to_thread(
+                                download_attachment_fn, feishu_token, outfit_token
+                            )
+                            if outfit_bytes and len(outfit_bytes) > 100:
+                                outfit_image_bytes_list.append(outfit_bytes)
+
                         image_result = await asyncio.to_thread(
                             run_image_generation,
                             image_bytes,
                             row.product_title,
                             row.image_count,
+                            outfit_image_bytes_list,
                         )
                         local_images = _materialize_generated_images(image_result)
                         row_result["image_urls"] = (
                             image_result.get("image_urls", []) if image_result else []
+                        )
+                        row_result["image_reference_mode"] = (
+                            image_result.get("reference_mode", "") if image_result else ""
+                        )
+                        row_result["image_reference_fields"] = (
+                            image_result.get("reference_fields", []) if image_result else []
                         )
 
                 # 3) 入队微信发送
@@ -959,6 +977,8 @@ async def batch_generate_preview():
                     "record_id": r.record_id,
                     "product_title": r.product_title,
                     "has_image": len(r.image_file_tokens) > 0,
+                    "has_outfit_images": len(r.outfit_image_file_tokens) > 0,
+                    "outfit_image_count": len(r.outfit_image_file_tokens),
                     "review_count": r.review_count,
                     "image_count": r.image_count,
                     "wechat_contacts": r.wechat_contacts,

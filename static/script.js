@@ -53,6 +53,7 @@ function renderPreviewTable(rows) {
     <th>#</th>
     <th>商品标题</th>
     <th>平铺图</th>
+    <th>穿搭图</th>
     <th>评价数</th>
     <th>晒图数</th>
     <th>状态</th>
@@ -71,6 +72,9 @@ function renderPreviewTable(rows) {
       <td class="cell-title" title="${escapeHtml(row.product_title)}">${escapeHtml(row.product_title)}</td>
       <td>${row.has_image
         ? '<span class="has-image-yes">有</span>'
+        : '<span class="has-image-no">无</span>'}</td>
+      <td>${row.has_outfit_images
+        ? `<span class="has-image-yes">${row.outfit_image_count || 0}张</span>`
         : '<span class="has-image-no">无</span>'}</td>
       <td>${row.review_count}</td>
       <td>${row.image_count}</td>
@@ -129,8 +133,8 @@ function updateTableWithResults(results) {
     if (!tr) return;
 
     const cells = tr.querySelectorAll('td');
-    const statusCell = cells[5];
-    const noteCell = cells[6];
+    const statusCell = cells[6];
+    const noteCell = cells[7];
 
     if (r.status === 'success') {
       statusCell.innerHTML = '<span class="row-status success">成功</span>';

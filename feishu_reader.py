@@ -31,6 +31,7 @@ class SourceRow:
     record_id: str
     product_title: str
     image_file_tokens: list[str]
+    outfit_image_file_tokens: list[str]
     review_count: int
     image_count: int
     wechat_contacts: list[str]
@@ -116,6 +117,13 @@ def parse_source_row(record: dict) -> SourceRow | None:
             if isinstance(att, dict) and att.get("file_token"):
                 image_file_tokens.append(att["file_token"])
 
+    outfit_image_file_tokens: list[str] = []
+    raw_outfit_images = fields.get("穿搭参考图")
+    if isinstance(raw_outfit_images, list):
+        for att in raw_outfit_images:
+            if isinstance(att, dict) and att.get("file_token"):
+                outfit_image_file_tokens.append(att["file_token"])
+
     review_count = _parse_int(fields.get("评价数量"), default=5)
     image_count = _parse_int(fields.get("晒图数量"), default=2)
     wechat_contacts = _parse_wechat_contacts(fields.get("微信联系人"))
@@ -126,6 +134,7 @@ def parse_source_row(record: dict) -> SourceRow | None:
         record_id=record_id,
         product_title=product_title,
         image_file_tokens=image_file_tokens,
+        outfit_image_file_tokens=outfit_image_file_tokens,
         review_count=review_count,
         image_count=image_count,
         wechat_contacts=wechat_contacts,

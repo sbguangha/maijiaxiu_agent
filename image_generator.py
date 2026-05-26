@@ -102,31 +102,19 @@ def generate_scene_prompts(product_name: str, scene_count: int = 2) -> list[str]
 
 
 # ========== 2. 调用 doubao 图生图 ==========
-def generate_lifestyle_image(prompt: str, image_base64: str) -> str | None:
-    """
-    调用 doubao-seedream-4-5 API，传入白底图的 base64 数据和场景 Prompt，
-    返回生成的生活场景图片 URL。
-    """
+def _image_bytes_to_data_uri(image_bytes: bytes, mime_type: str = "image/png") -> str:
+    return f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+
+
+def _post_doubao_payload(payload: dict) -> str | None:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {DOUBAO_API_KEY}"
     }
 
-    payload = {
-        "model": "doubao-seedream-4-5-251128",
-        "prompt": prompt,
-        "image": image_base64,
-        "sequential_image_generation": "disabled",
-        "response_format": "url",
-        "size": "2K",
-        "stream": False,
-        "watermark": False
-    }
-
     try:
         # 自动重试（应对 429 过载错误）
         max_retries = 3
-        response = None
         for attempt in range(max_retries):
             response = requests.post(DOUBAO_API_URL, headers=headers, json=payload, timeout=120)
             data = response.json()
@@ -141,15 +129,67 @@ def generate_lifestyle_image(prompt: str, image_base64: str) -> str | None:
 
             if "data" in data and len(data["data"]) > 0:
                 return data["data"][0].get("url")
-            else:
-                print(f"doubao 生图失败: {json.dumps(data, ensure_ascii=False)}")
-                return None
 
-        print(f"doubao API 多次重试后仍失败")
+            print(f"doubao 生图失败: {json.dumps(data, ensure_ascii=False)}")
+            return None
+
+        print("doubao API 多次重试后仍失败")
         return None
     except Exception as e:
         print(f"doubao API 调用异常: {str(e)}")
         return None
+
+
+def generate_lifestyle_image(prompt: str, image_base64: str) -> str | None:
+    """
+    调用 doubao-seedream-4-5 API，传入白底图的 base64 数据和场景 Prompt，
+    返回生成的生活场景图片 URL。
+    """
+    payload = {
+        "model": "doubao-seedream-4-5-251128",
+        "prompt": prompt,
+        "image": image_base64,
+        "sequential_image_generation": "disabled",
+        "response_format": "url",
+        "size": "2K",
+        "stream": False,
+        "watermark": False
+    }
+
+    return _post_doubao_payload(payload)
+
+
+def generate_lifestyle_image_with_references(
+    prompt: str,
+    product_image_base64: str,
+    outfit_image_base64: str,
+) -> tuple[str | None, str]:
+    """
+    使用商品平铺图 + 单张穿搭参考图进行多图参考生成。
+    当前火山方舟接口的单图生图使用 image 字段，这里用同一字段传入两张图数组。
+    如果接口不支持双图数组，直接失败，避免未知字段被忽略后变成纯提示词生图。
+    """
+    base_payload = {
+        "model": "doubao-seedream-4-5-251128",
+        "prompt": prompt,
+        "sequential_image_generation": "disabled",
+        "response_format": "url",
+        "size": "2K",
+        "stream": False,
+        "watermark": False
+    }
+
+    reference_images = [product_image_base64, outfit_image_base64]
+    field_name = "image"
+    payload = {**base_payload, field_name: reference_images}
+    print(f"  使用多图字段 {field_name} 进行双图参考生成，输入图片数={len(reference_images)}...")
+    url = _post_doubao_payload(payload)
+    if url:
+        print(f"  ✅ 双图参考生成成功，使用字段: {field_name}")
+        return url, field_name
+
+    print("  ⚠️ 双图参考生成失败，未回退到单商品图生图")
+    return None, ""
 
 
 # ========== 3. 飞书相关函数 ==========
@@ -262,20 +302,43 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
 
 
 # ========== 4. 主流程编排 ==========
-def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int = 2) -> dict:
+def _build_outfit_reference_prompt(product_name: str, index: int, total: int) -> str:
+    return (
+        f"请基于两张参考图生成一张真实买家秀照片。商品名称：{product_name}。"
+        f"第一张图是商品平铺图，必须严格保留商品的颜色、版型、图案、领型、袖型、长度和材质质感。"
+        f"第二张图是穿搭参考图，只参考其中的人物姿势、拍摄角度、构图、光线、场景氛围和手机拍摄质感，"
+        f"不要保留第二张图里原有衣服的款式、颜色、图案。"
+        f"将第一张图中的商品自然穿到第二张图人物身上。不要改变商品颜色，不要改变款式，"
+        f"不要增加不存在的图案。保持真实普通人买家秀质感，避免商业广告、棚拍、过度磨皮、AI 精修感。"
+        f"人物为自然中国人特征，背景、构图和拍摄方式参考第二张图。"
+        f"这是第 {index}/{total} 张图，请保持自然、真实、像手机随手拍。"
+    )
+
+
+def run_image_generation(
+    image_bytes: bytes,
+    product_name: str,
+    scene_count: int = 2,
+    outfit_image_bytes_list: list[bytes] | None = None,
+) -> dict:
     """
     完整的图片生成主流程：
-    1. 上传白底图到飞书 → 拿到 file_token 和公网 URL
-    2. Kimi 生成场景 Prompt
-    3. doubao 逐个生成场景图
+    1. 上传白底图到飞书
+    2. 如果存在穿搭参考图，则使用商品图 + 单张穿搭图双图参考生成
+       否则保留旧的 Kimi 场景 Prompt + 单图生图逻辑
+    3. doubao 逐个生成买家秀图
     4. 每张场景图上传飞书
     5. 写入飞书表格
     """
+    outfit_image_bytes_list = outfit_image_bytes_list or []
     result = {
         "status": "error",
         "message": "",
         "prompts": [],
         "image_urls": [],
+        "reference_mode": "product_plus_outfit" if outfit_image_bytes_list else "product_only",
+        "outfit_reference_count": len(outfit_image_bytes_list),
+        "reference_fields": [],
     }
 
     # Step 0: 获取飞书 Token
@@ -291,12 +354,19 @@ def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int
         result["message"] = "❌ 商品图上传飞书失败"
         return result
 
-    # 构造 base64 数据 URI（doubao 需要公网可访问的图片，飞书链接需要认证，所以用 base64 代替）
-    product_image_base64 = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+    # 构造 base64 数据 URI（飞书链接需要认证，所以用 base64 代替）
+    product_image_base64 = _image_bytes_to_data_uri(image_bytes)
 
-    # Step 2: Kimi 生成场景 Prompt
-    print(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
-    prompts = generate_scene_prompts(product_name, scene_count)
+    # Step 2: 生成提示词。存在穿搭参考图时使用固定强约束，减少模型自由发挥。
+    if outfit_image_bytes_list:
+        print(f"🎨 检测到 {len(outfit_image_bytes_list)} 张穿搭参考图，使用双图参考生成...")
+        prompts = [
+            _build_outfit_reference_prompt(product_name, i + 1, scene_count)
+            for i in range(scene_count)
+        ]
+    else:
+        print(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
+        prompts = generate_scene_prompts(product_name, scene_count)
     result["prompts"] = prompts
 
     if not prompts:
@@ -310,13 +380,24 @@ def run_image_generation(image_bytes: bytes, product_name: str, scene_count: int
     for i, prompt in enumerate(prompts):
         print(f"🖼️  正在生成第 {i+1}/{len(prompts)} 张配图: {prompt[:30]}...")
 
-        # 调用 doubao 图生图（传 base64）
-        strict_prompt = (
-            f"{prompt}。"
-            f"保持衣服颜色和参考图一致。"
-            f"人物为中国人特征，面部自然，避免外国人或欧美模特感。"
-        )
-        gen_url = generate_lifestyle_image(strict_prompt, product_image_base64)
+        if outfit_image_bytes_list:
+            outfit_bytes = outfit_image_bytes_list[i % len(outfit_image_bytes_list)]
+            outfit_image_base64 = _image_bytes_to_data_uri(outfit_bytes)
+            gen_url, reference_field = generate_lifestyle_image_with_references(
+                prompt,
+                product_image_base64,
+                outfit_image_base64,
+            )
+            if reference_field:
+                result["reference_fields"].append(reference_field)
+        else:
+            # 调用 doubao 图生图（传 base64）
+            strict_prompt = (
+                f"{prompt}。"
+                f"保持衣服颜色和参考图一致。"
+                f"人物为中国人特征，面部自然，避免外国人或欧美模特感。"
+            )
+            gen_url = generate_lifestyle_image(strict_prompt, product_image_base64)
         if gen_url:
             generated_urls.append(gen_url)
 

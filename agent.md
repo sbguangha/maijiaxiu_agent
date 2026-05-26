@@ -11,7 +11,7 @@
 
 ### 1. 文本生成与配图 (agent_graph.py / agent_tools.py / image_generator.py)
 - **模型**: Kimi (Moonshot-v1-8k) 用于评价生成
-- **配图模型**: doubao-seedream-4-5-251128 用于生活场景图生成
+- **配图模型**: doubao-seedream-4-5-251128 用于商品平铺图 + 穿搭参考图的买家秀生成
 - **数据持久化**: 飞书多维表格存储商品主图和生成的买家秀图片
 
 ### 2. 微信发送队列 (outbox.py / app.py)
@@ -39,6 +39,7 @@
 - `GET /batch-generate/preview` - 预览需求表内容（不触发生成）
 - `POST /batch-generate` - 开始批量生成（逐行处理，实时返回进度）
 - `GET /batch-generate/status` - 查询批量任务状态
+- `穿搭参考图` - 需求表新增附件字段，生成晒图时按顺序轮流作为参考图使用
 
 **涉及文件**:
 - `feishu_reader.py` - 读取需求表 + 下载附件图片
@@ -138,7 +139,7 @@ pip install pyautogui pyperclip pywin32 pillow
 
 1. **环境检查**: 确保 `python app.py` 在 127.0.0.1:8000 运行
 2. **飞书配置**: `.env` 中必须有 `FEISHU_SOURCE_APP_TOKEN` 和 `FEISHU_SOURCE_TABLE_ID`（新表）
-3. **字段名精确匹配**: 新表列名必须是 `商品标题`、`商品平铺图`、`评价数量（个）`、`晒图数量（组）`
+3. **字段名精确匹配**: 新表列名必须包含 `商品标题`、`商品平铺图`、`穿搭参考图`、`评价数量`、`晒图数量`
 4. **前端已替换**: 旧的手动上传 UI 已删除，现在是批量处理界面
 5. **影刀流程**: 保持不变，仍通过 `/outbox/next` 轮询取任务
 
@@ -150,4 +151,4 @@ pip install pyautogui pyperclip pywin32 pillow
 - **两张飞书表**:
   - 新表（需求源）: `RsntbWqoaaDlUzsO6atc1kKonge` / `tblg6LRZra5FGtgM`
   - 旧表（结果写入）: `Ossab9kfraHqFNssdiuciUtlnKy` / `tbl6oJqpHgRfoeO4`
-- **批量生成流程**: 读取新表 -> 逐行下载平铺图 -> 按"评价数量"生成评价 -> 按"晒图数量"生成配图 -> 写入旧表 -> 入队 outbox
+- **批量生成流程**: 读取新表 -> 逐行下载平铺图和穿搭参考图 -> 按"评价数量"生成评价 -> 按"晒图数量"轮流使用穿搭图生成配图 -> 写入旧表 -> 入队 outbox
