@@ -24,7 +24,11 @@ BASE_DIR = Path(__file__).parent.resolve()
 class LLMSettings(BaseSettings):
     """大模型 API 配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="", extra="ignore",
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+    )
 
     moonshot_api_key: str = Field(default="", alias="MOONSHOT_API_KEY")
     moonshot_base_url: str = Field(default="https://api.moonshot.cn/v1", alias="MOONSHOT_BASE_URL")
@@ -48,7 +52,11 @@ class LLMSettings(BaseSettings):
 class FeishuSettings(BaseSettings):
     """飞书开放平台配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="", extra="ignore",
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+    )
 
     app_id: str = Field(default="", alias="FEISHU_APP_ID")
     app_secret: str = Field(default="", alias="FEISHU_APP_SECRET")
@@ -69,7 +77,11 @@ class FeishuSettings(BaseSettings):
 class OutboxSettings(BaseSettings):
     """影刀发送队列配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="", extra="ignore",
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+    )
 
     db_path: str = Field(
         default=str(BASE_DIR / "data" / "outbox.db"),
@@ -101,7 +113,11 @@ class OutboxSettings(BaseSettings):
 class PathSettings(BaseSettings):
     """文件路径配置。"""
 
-    model_config = SettingsConfigDict(env_prefix="", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="", extra="ignore",
+        env_file=str(BASE_DIR / ".env"),
+        env_file_encoding="utf-8",
+    )
 
     generated_image_dir: str = Field(
         default=str(BASE_DIR / "data" / "generated_images"),
