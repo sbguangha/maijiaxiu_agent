@@ -749,8 +749,16 @@ def confirm_delivery_approval(
     db_path: str,
     approval_id: str,
     note: str = "",
+    enqueue: bool = True,
+    queued_task_id: str | None = None,
 ) -> DeliveryApproval | None:
-    """确认发送：将待确认记录入队到 outbox_tasks，并更新状态为 confirmed。"""
+    """确认发送：将待确认记录更新为 confirmed，可选入队到 outbox_tasks。
+
+    Args:
+        enqueue: 是否调用 enqueue_task 自动入队。LangGraph 模式时可设为 False，
+                 由外部传入 queued_task_id 直接写入。
+        queued_task_id: 外部已生成的 task_id，直接写入（enqueue=False 时使用）。
+    """
     now = _utc_now()
     with _LOCK:
         with sqlite3.connect(db_path) as conn:
@@ -766,7 +774,7 @@ def confirm_delivery_approval(
                 return None
 
             item = DeliveryApproval.from_row(row)
-            if item.queued_task_id:
+            if item.queued_task_id and item.queued_task_id != "__pending_enqueue__":
                 return item
             if item.status == "rejected":
                 return item
@@ -774,28 +782,30 @@ def confirm_delivery_approval(
             conn.execute(
                 """
                 UPDATE delivery_approvals
-                SET status = 'confirmed', queued_task_id = '__pending_enqueue__',
+                SET status = 'confirmed', queued_task_id = ?,
                     approved_at = ?, updated_at = ?, note = ?
                 WHERE approval_id = ? AND status = 'pending'
                 """,
-                (_to_iso(now), _to_iso(now), note or item.note, approval_id),
+                (queued_task_id or "__pending_enqueue__", _to_iso(now), _to_iso(now), note or item.note, approval_id),
             )
 
-    task = enqueue_task(
-        db_path=db_path,
-        target_contacts=item.target_contacts,
-        review_text=item.review_text,
-        image_paths=item.image_paths,
-        file_paths=item.file_paths,
-        max_retry=item.max_retry,
-    )
+    if enqueue:
+        task = enqueue_task(
+            db_path=db_path,
+            target_contacts=item.target_contacts,
+            review_text=item.review_text,
+            image_paths=item.image_paths,
+            file_paths=item.file_paths,
+            max_retry=item.max_retry,
+        )
+        queued_task_id = task.task_id
 
-    with _LOCK:
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                "UPDATE delivery_approvals SET queued_task_id = ?, updated_at = ? WHERE approval_id = ?",
-                (task.task_id, _to_iso(_utc_now()), approval_id),
-            )
+        with _LOCK:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE delivery_approvals SET queued_task_id = ?, updated_at = ? WHERE approval_id = ?",
+                    (queued_task_id, _to_iso(_utc_now()), approval_id),
+                )
 
     return get_delivery_approval(db_path, approval_id)
 

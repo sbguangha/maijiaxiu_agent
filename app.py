@@ -24,6 +24,15 @@ if sys.stderr and hasattr(sys.stderr, "buffer"):
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+# LangGraph interrupt 异常兼容导入
+try:
+    from langgraph.errors import GraphInterrupt
+except Exception:
+    try:
+        from langgraph.types import GraphInterrupt
+    except Exception:
+        GraphInterrupt = Exception
+
 import requests
 from fastapi import FastAPI, Request, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
@@ -64,11 +73,13 @@ app = FastAPI(
 # 挂载静态资源
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
-OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", os.path.join(BASE_DIR, "data", "outbox.db"))
-GENERATED_IMAGE_DIR = os.getenv("GENERATED_IMAGE_DIR", os.path.join(BASE_DIR, "data", "generated_images"))
-OUTBOX_FILE_DIR = os.getenv("OUTBOX_FILE_DIR", os.path.join(BASE_DIR, "data", "outbox_files"))
-DEFAULT_TARGET_CONTACTS = os.getenv("WECHAT_TARGET_CONTACTS", os.getenv("WECHAT_TARGET_CONTACT", ""))
-HEARTBEAT_FILE = os.getenv("OUTBOX_HEARTBEAT_FILE", os.path.join(BASE_DIR, "logs", "outbox_heartbeat.jsonl"))
+from config import settings  # pylint: disable=wrong-import-position
+
+OUTBOX_DB_PATH = settings.outbox.db_path
+GENERATED_IMAGE_DIR = settings.paths.generated_image_dir
+OUTBOX_FILE_DIR = settings.outbox.file_dir
+DEFAULT_TARGET_CONTACTS = settings.outbox.default_target_contacts
+HEARTBEAT_FILE = settings.outbox.heartbeat_file
 
 
 def _parse_env_bool(raw: str, default: bool = False) -> bool:
@@ -82,10 +93,7 @@ def _parse_env_bool(raw: str, default: bool = False) -> bool:
     return default
 
 
-REQUIRE_DELIVERY_CONFIRMATION = _parse_env_bool(
-    os.getenv("REQUIRE_DELIVERY_CONFIRMATION", "false"),
-    default=False,
-)
+REQUIRE_DELIVERY_CONFIRMATION = settings.outbox.require_confirmation
 
 
 @app.on_event("startup")
@@ -129,6 +137,25 @@ def _get_generation_runners():
     from agent_graph import run_agent  # pylint: disable=import-outside-toplevel
     from image_generator import run_image_generation  # pylint: disable=import-outside-toplevel
     return run_agent, run_image_generation
+
+
+def _get_agent_v2():
+    """延迟导入 LangGraph V2 Agent 接口。"""
+    from agent_graph_v2 import (  # pylint: disable=import-outside-toplevel
+        run_agent_v2,
+        resume_agent_v2,
+        get_agent_state,
+    )
+    return run_agent_v2, resume_agent_v2, get_agent_state
+
+
+def _get_batch_graph():
+    """延迟导入批量子图接口。"""
+    from batch_graph import (  # pylint: disable=import-outside-toplevel
+        run_batch_generate,
+        get_batch_state,
+    )
+    return run_batch_generate, get_batch_state
 
 
 class OutboxEnqueueRequest(BaseModel):
@@ -196,84 +223,96 @@ async def chat_with_image(
 ):
     """
     接收用户输入的文字 + 商品白底图。
-    流程：1. 先用文字生成评价  2. 再用白底图生成晒图
+    流程：调用 LangGraph V2 Agent 一次性完成评价生成、配图生成、[人工确认]、入队发送。
     """
+    run_agent_v2, _, get_agent_state = _get_agent_v2()
+    image_bytes = await file.read()
+
+    file_paths: List[str] = []
+    if table_file is not None:
+        file_paths.extend(await _save_uploaded_files([table_file], prefix="table"))
+
+    # 如果前端没传联系人，强制使用环境变量
+    raw_contacts = target_contacts or target_contact
+    if not raw_contacts:
+        raw_contacts = DEFAULT_TARGET_CONTACTS
+    contacts = _parse_target_contacts(raw_contacts)
+
+    thread_id = str(uuid4())
+    require_confirmation = REQUIRE_DELIVERY_CONFIRMATION if enqueue_for_delivery and contacts else False
+
     try:
-        run_agent, run_image_generation = _get_generation_runners()
-        image_bytes = await file.read()
+        print(f"📝 启动 Agent V2，thread_id={thread_id}, require_confirmation={require_confirmation}")
+        result = await asyncio.to_thread(
+            run_agent_v2,
+            user_input=user_input,
+            thread_id=thread_id,
+            product_image_bytes=image_bytes,
+            outfit_image_bytes_list=[],
+            target_contacts=contacts,
+            review_count=5,
+            image_count=2,
+            require_confirmation=require_confirmation,
+        )
 
-        # ===== 第一步：生成评价 =====
-        review_text = ""
-        if user_input.strip():
-            print(f"📝 正在生成评价: {user_input[:50]}...")
-            raw_review_text = await asyncio.to_thread(run_agent, user_input)
-            review_text = _format_review_text_for_delivery(raw_review_text)
+        # 正常完成（未启用人工确认，或确认已快速通过）
+        review_text = result.get("reviews_formatted", "")
+        image_result = result.get("image_result")
+        local_images = result.get("local_image_paths", [])
+        task_id = result.get("task_id")
 
-        # ===== 第二步：生成晒图 =====
-        image_result = None
-        if image_bytes:
-            # 从用户输入中提取商品名称（去掉"生成X条评价"等指令词，留下商品名）
-            product_name = _extract_product_name(user_input) or "服装商品"
-            print(f"📸 正在生成晒图，商品: {product_name}")
-            image_result = await asyncio.to_thread(
-                run_image_generation, image_bytes, product_name, 2  # 默认 2 组晒图
-            )
-
-        queue_result = None
-        approval_result = None
-        file_paths: List[str] = []
-        if table_file is not None:
-            file_paths.extend(await _save_uploaded_files([table_file], prefix="table"))
-
-        # 如果前端没传联系人，强制使用环境变量
-        raw_contacts = target_contacts or target_contact
-        if not raw_contacts:
-            raw_contacts = DEFAULT_TARGET_CONTACTS
-        contacts = _parse_target_contacts(raw_contacts)
-        local_images = _materialize_generated_images(image_result)
-
-        if enqueue_for_delivery and contacts:
-            if REQUIRE_DELIVERY_CONFIRMATION:
-                approval_result = _create_delivery_approval(
-                    source="chat-with-image",
-                    product_title=_extract_product_name(user_input) or "未命名商品",
-                    target_contacts=contacts,
-                    review_text=review_text,
-                    image_paths=local_images,
-                    file_paths=file_paths,
-                    max_retry=4,
-                )
-            else:
-                task = enqueue_task(
-                    db_path=OUTBOX_DB_PATH,
-                    target_contacts=contacts,
-                    review_text=review_text,
-                    image_paths=local_images,
-                    file_paths=file_paths,
-                    max_retry=4,
-                )
-                queue_result = _task_to_dict(task)
+        queue_result = _task_to_dict_from_state(result) if task_id else None
 
         return JSONResponse(content={
             "reply": review_text,
             "image_result": image_result,
             "queue_result": queue_result,
-            "queue_message": (
-                "待人工确认后发送"
-                if approval_result
-                else ("已加入发送队列" if queue_result else "未入队：未提供 target_contacts")
-            ),
-            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+            "queue_message": "已加入发送队列" if task_id else "未入队",
+            "require_confirmation": False,
+            "approval_result": None,
+            "materialized_images": local_images,
+            "materialized_files": file_paths,
+            "thread_id": thread_id,
+        })
+
+    except GraphInterrupt as e:
+        # 图在 human_approval 节点中断，需要人工确认
+        print(f"⏸️ Agent V2 中断等待人工确认，thread_id={thread_id}")
+        state = get_agent_state(thread_id)
+        review_text = state.get("reviews_formatted", "") if state else ""
+        local_images = state.get("local_image_paths", []) if state else []
+        product_name = state.get("product_name", "未命名商品") if state else "未命名商品"
+
+        approval_result = _create_delivery_approval(
+            source="chat-with-image",
+            product_title=product_name,
+            target_contacts=contacts,
+            review_text=review_text,
+            image_paths=local_images,
+            file_paths=file_paths,
+            max_retry=4,
+            extra={"thread_id": thread_id, "interrupt_payload": getattr(e, "value", None)},
+        )
+
+        return JSONResponse(content={
+            "reply": review_text,
+            "image_result": state.get("image_result") if state else None,
+            "queue_result": None,
+            "queue_message": "待人工确认后发送",
+            "require_confirmation": True,
             "approval_result": approval_result,
             "materialized_images": local_images,
             "materialized_files": file_paths,
+            "thread_id": thread_id,
         })
 
     except Exception as e:
+        logger.exception("chat-with-image 异常")
         return JSONResponse(
             content={
                 "reply": f"⚠️ 处理出错：{str(e)}\n请稍后重试。",
                 "image_result": None,
+                "thread_id": thread_id,
             },
             status_code=200
         )
@@ -456,6 +495,18 @@ def _task_to_dict(task) -> Dict[str, Any]:
     }
 
 
+def _task_to_dict_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """从 AgentState 字典中提取出 task 相关信息。"""
+    return {
+        "task_id": state.get("task_id"),
+        "target_contacts": state.get("target_contacts", []),
+        "review_text": state.get("reviews_formatted", ""),
+        "image_paths": state.get("local_image_paths", []),
+        "file_paths": [],
+        "status": "completed" if state.get("task_id") else "pending",
+    }
+
+
 def _create_delivery_approval(
     *,
     source: str,
@@ -548,23 +599,34 @@ async def confirm_delivery_approval(
             return JSONResponse(content={"approval": existing.to_dict(), "message": "already_confirmed"})
 
         note = payload.note if payload else ""
-        updated = db_confirm_approval(OUTBOX_DB_PATH, approval_id, note=note)
+        thread_id = existing.extra.get("thread_id") if existing.extra else None
+
+        # 如果存在 LangGraph thread_id，先恢复图执行（由图的 enqueue_delivery 节点入队）
+        task_id = None
+        if thread_id:
+            _, resume_agent_v2, _ = _get_agent_v2()
+            result = await asyncio.to_thread(resume_agent_v2, thread_id, "confirmed", note)
+            task_id = result.get("task_id")
+
+        # 更新 approval 记录，但不重复 enqueue
+        updated = db_confirm_approval(
+            OUTBOX_DB_PATH,
+            approval_id,
+            note=note,
+            enqueue=False,
+            queued_task_id=task_id or "__langgraph__",
+        )
         if not updated:
             return JSONResponse(content={"error": "confirm_failed"}, status_code=500)
 
-        task_dict = None
-        if updated.queued_task_id:
-            tasks = list_tasks(OUTBOX_DB_PATH, limit=1, status=None)
-            matched = next((t for t in tasks if t.task_id == updated.queued_task_id), None)
-            if matched:
-                task_dict = _task_to_dict(matched)
-
+        task_dict = _task_to_dict_from_state(result) if task_id else None
         return JSONResponse(content={
             "approval": updated.to_dict(),
             "task": task_dict,
             "message": "queued",
         })
     except Exception as e:
+        logger.exception("确认发送失败")
         return JSONResponse(content={"error": str(e)}, status_code=400)
 
 
@@ -581,13 +643,35 @@ async def reject_delivery_approval(
             return JSONResponse(content={"error": "approval_already_confirmed"}, status_code=400)
 
         note = payload.note if payload else ""
+        thread_id = existing.extra.get("thread_id") if existing.extra else None
+
+        # 如果存在 LangGraph thread_id，恢复图执行并驳回
+        if thread_id:
+            _, resume_agent_v2, _ = _get_agent_v2()
+            await asyncio.to_thread(resume_agent_v2, thread_id, "rejected", note)
+
         updated = db_reject_approval(OUTBOX_DB_PATH, approval_id, note=note)
         if not updated:
             return JSONResponse(content={"error": "reject_failed"}, status_code=500)
 
         return JSONResponse(content={"approval": updated.to_dict(), "message": "rejected"})
     except Exception as e:
+        logger.exception("驳回发送失败")
         return JSONResponse(content={"error": str(e)}, status_code=400)
+
+
+@app.get("/agent/state/{thread_id}")
+async def get_agent_thread_state(thread_id: str):
+    """查询 LangGraph Agent 某条 thread 的当前执行状态。"""
+    try:
+        _, _, get_agent_state_fn = _get_agent_v2()
+        state = get_agent_state_fn(thread_id)
+        if state is None:
+            return JSONResponse(content={"error": "thread_not_found"}, status_code=404)
+        return JSONResponse(content={"thread_id": thread_id, "state": state})
+    except Exception as e:
+        logger.exception("查询 Agent 状态失败")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.get("/outbox/next")
@@ -958,6 +1042,69 @@ async def batch_generate_status(batch_id: str = Query(default="")):
     if not batch_id or batch_id not in _batch_status:
         return JSONResponse(content={"error": "batch_id not found"}, status_code=404)
     return JSONResponse(content={"batch_id": batch_id, **_batch_status[batch_id]})
+
+
+# ===== 批量生成 V2（LangGraph 子图） =====
+
+@app.post("/batch-generate-v2")
+async def batch_generate_v2():
+    """
+    使用 LangGraph 批量子图处理飞书需求表。
+    每行都是一个 checkpoint，支持中断恢复。
+    """
+    batch_id = str(uuid4())[:8]
+    try:
+        run_batch_generate, _ = _get_batch_graph()
+        default_contacts = _parse_target_contacts(DEFAULT_TARGET_CONTACTS)
+
+        logger.info("[batch-v2-%s] 启动批量生成", batch_id)
+        result = await asyncio.to_thread(
+            run_batch_generate,
+            batch_id=batch_id,
+            default_contacts=default_contacts,
+            require_confirmation=False,
+        )
+
+        return JSONResponse(content={
+            "batch_id": batch_id,
+            "message": result.get("final_message", "完成"),
+            "total": len(result.get("source_rows", [])),
+            "success_count": result.get("success_count", 0),
+            "error_count": result.get("error_count", 0),
+            "results": result.get("batch_results", []),
+            "error": result.get("error_message"),
+        })
+    except Exception as e:
+        logger.exception("[batch-v2-%s] 批量生成异常", batch_id)
+        return JSONResponse(
+            content={"batch_id": batch_id, "error": str(e)},
+            status_code=500,
+        )
+
+
+@app.get("/batch-generate-v2/status")
+async def batch_generate_v2_status(batch_id: str = Query(default="")):
+    """查询 LangGraph 批量子图的执行状态。"""
+    if not batch_id:
+        return JSONResponse(content={"error": "batch_id required"}, status_code=400)
+    try:
+        _, get_batch_state_fn = _get_batch_graph()
+        state = get_batch_state_fn(batch_id)
+        if state is None:
+            return JSONResponse(content={"error": "batch_id not found"}, status_code=404)
+        return JSONResponse(content={
+            "batch_id": batch_id,
+            "current_index": state.get("current_index", 0),
+            "total": len(state.get("source_rows", [])),
+            "success_count": state.get("success_count", 0),
+            "error_count": state.get("error_count", 0),
+            "final_message": state.get("final_message"),
+            "error": state.get("error_message"),
+            "results": state.get("batch_results", []),
+        })
+    except Exception as e:
+        logger.exception("查询 batch-v2 状态失败")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.get("/batch-generate/preview")
