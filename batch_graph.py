@@ -16,7 +16,8 @@ import threading
 from typing import Any, Dict, List, Optional, TypedDict, Annotated, Union
 
 import operator
-from langgraph.graph import StateGraph, END, CompiledStateGraph
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver

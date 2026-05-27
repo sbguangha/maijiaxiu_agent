@@ -12,7 +12,8 @@ import sqlite3
 import logging
 from typing import Any, Dict, Optional, Union
 
-from langgraph.graph import StateGraph, END, CompiledStateGraph
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
