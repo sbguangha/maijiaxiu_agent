@@ -698,7 +698,7 @@ def _append_heartbeat(data: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-# ===== 批量生成 V2（LangGraph 子图） =====
+# ===== 批量生成 V2（LangGraph Send 并行） =====
 
 def _get_feishu_reader():
     from feishu_reader import (  # pylint: disable=import-outside-toplevel
@@ -708,14 +708,6 @@ def _get_feishu_reader():
     )
     return fetch_all_source_rows, download_attachment, update_source_row_status
 
-
-@app.post("/batch-generate")
-async def batch_generate():
-    """已迁移到 LangGraph V2，转发到 /batch-generate-v2。"""
-    return await batch_generate_v2()
-
-
-# ===== 批量生成 V2（LangGraph 子图） =====
 
 @app.post("/batch-generate-v2")
 async def batch_generate_v2():
@@ -742,7 +734,7 @@ async def batch_generate_v2():
             "total": len(result.get("source_rows", [])),
             "success_count": result.get("success_count", 0),
             "error_count": result.get("error_count", 0),
-            "results": result.get("batch_results", []),
+            "results": result.get("row_results", []),
             "error": result.get("error_message"),
         })
     except Exception as e:
@@ -771,7 +763,7 @@ async def batch_generate_v2_status(batch_id: str = Query(default="")):
             "error_count": state.get("error_count", 0),
             "final_message": state.get("final_message"),
             "error": state.get("error_message"),
-            "results": state.get("batch_results", []),
+            "results": state.get("row_results", []),
         })
     except Exception as e:
         logger.exception("查询 batch-v2 状态失败")
