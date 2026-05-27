@@ -5,16 +5,22 @@ LangGraph Agent 节点集合
 
 from __future__ import annotations
 
+import re
 import logging
 from typing import Any, Dict, List, Optional
 
 from langgraph.types import interrupt
 
 from agent_state import AgentState
+from agent_tools import parse_product_url, extract_selling_points, generate_reviews
+from config import create_moonshot_llm, settings
+from image_generator import run_image_generation
 from outbox import enqueue_task
 from utils import (
     format_review_text_for_delivery,
     materialize_generated_images,
+    extract_product_name,
+    URL_PATTERN,
 )
 
 logger = logging.getLogger("agent-nodes")
@@ -23,27 +29,10 @@ logger = logging.getLogger("agent-nodes")
 def parse_input_node(state: AgentState) -> Dict[str, Any]:
     """解析用户输入，提取商品链接和商品名称。"""
     user_input = state.get("user_input", "")
-    product_url: Optional[str] = None
-    product_name: Optional[str] = None
 
-    # 尝试提取 URL
-    url_pattern = re.compile(
-        r'https?://[^\s<>"{}|\\^`\[\]]+',
-        re.IGNORECASE,
-    )
-    match = url_pattern.search(user_input)
-    if match:
-        product_url = match.group(0)
-
-    # 提取商品名称：去掉 URL 和常见指令词
-    cleaned = re.sub(url_pattern, "", user_input)
-    cleaned = re.sub(r'(帮我|请|生成|写|条评价|条评论|评价|评论|\d+条?|[，,。！])', '', cleaned).strip()
-    # 尝试匹配 "商品：xxx"
-    m = re.search(r'商品[：:叫是]\s*(.+?)(?:[，,。]|生成|$)', user_input)
-    if m:
-        product_name = m.group(1).strip()
-    elif cleaned:
-        product_name = cleaned
+    match = URL_PATTERN.search(user_input)
+    product_url = match.group(0) if match else None
+    product_name = extract_product_name(user_input)
 
     return {
         "product_url": product_url,
@@ -53,7 +42,7 @@ def parse_input_node(state: AgentState) -> Dict[str, Any]:
 
 def crawl_url_node(state: AgentState) -> Dict[str, Any]:
     """爬取商品链接获取标题和描述。"""
-    from agent_tools import parse_product_url  # pylint: disable=import-outside-toplevel
+
     url = state.get("product_url")
     if not url:
         return {
@@ -62,7 +51,7 @@ def crawl_url_node(state: AgentState) -> Dict[str, Any]:
         }
 
     try:
-        result = parse_product_url.invoke({"url": url})
+        result = parse_product_url(url)
         # parse_product_url 返回的是字符串
         if result and "解析失败" not in result:
             return {
@@ -86,7 +75,7 @@ def crawl_url_node(state: AgentState) -> Dict[str, Any]:
 
 def extract_selling_points_node(state: AgentState) -> Dict[str, Any]:
     """基于商品信息提取核心卖点。"""
-    from agent_tools import extract_selling_points  # pylint: disable=import-outside-toplevel
+
     product_info = state.get("product_info") or state.get("product_name") or state.get("user_input", "")
     if not product_info:
         return {
@@ -107,7 +96,7 @@ def extract_selling_points_node(state: AgentState) -> Dict[str, Any]:
 
 def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
     """根据商品名和卖点生成买家评价。"""
-    from agent_tools import generate_reviews  # pylint: disable=import-outside-toplevel
+
     product_name = state.get("product_name") or "服装商品"
     selling_points = state.get("selling_points") or ""
     count = state.get("review_count", 5)
@@ -146,7 +135,7 @@ def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
     """质检节点：用 LLM 检查生成的评价是否有 AI 味。"""
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
-    from config import create_moonshot_llm  # pylint: disable=import-outside-toplevel
+
 
     reviews = state.get("reviews_raw", "")
     if not reviews:
@@ -178,10 +167,10 @@ def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
 
     try:
         result = chain.invoke({"reviews": reviews})
-        passed = "通过" in result and "不通过" not in result
+        match = re.search(r'质检结果[：:]\s*(通过|不通过)', result)
+        passed = match and match.group(1) == "通过"
         feedback = None
         if not passed:
-            # 提取改进建议部分
             m = re.search(r"改进建议[：:]\s*(.+?)(?=\Z)", result, re.S)
             if m:
                 feedback = m.group(1).strip()
@@ -204,7 +193,7 @@ def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
 
 def generate_images_node(state: AgentState) -> Dict[str, Any]:
     """调用图生图模块生成买家秀配图。"""
-    from image_generator import run_image_generation  # pylint: disable=import-outside-toplevel
+
     if state.get("skip_image_generation"):
         return {"image_result": None, "local_image_paths": []}
 
@@ -272,7 +261,7 @@ def human_approval_node(state: AgentState) -> Dict[str, Any]:
 
 def enqueue_delivery_node(state: AgentState) -> Dict[str, Any]:
     """将生成结果入队到 Outbox，供影刀消费。"""
-    from config import settings  # pylint: disable=import-outside-toplevel
+
     db_path = settings.outbox.db_path
     target_contacts = state.get("target_contacts", [])
     review_text = state.get("reviews_formatted", "")
@@ -354,16 +343,49 @@ def route_after_parse_input(state: AgentState) -> str:
 
 def route_after_crawl(state: AgentState) -> str:
     """爬取后：无论成功失败都继续提取卖点（失败时会回退到用户输入）。"""
-    if not state.get("crawl_success"):
-        # 爬取失败，用 product_name 作为 product_info
-        return "extract_selling_points"
+    if state.get("error_message"):
+        return "handle_error"
     return "extract_selling_points"
 
 
-def route_after_generate_reviews(state: AgentState) -> str:
-    """生成评价后：如果需要配图且有图片数据，则生成配图。"""
+def route_after_generate_images(state: AgentState) -> str:
+    """生成配图后：如果需要人工确认则中断，否则直接入队。"""
+    if state.get("error_message"):
+        return "handle_error"
+    if state.get("require_confirmation"):
+        return "human_approval"
+    return "enqueue_delivery"
+
+
+def route_after_human_approval(state: AgentState) -> str:
+    """人工确认后：确认则入队，驳回则结束。"""
+    if state.get("error_message"):
+        return "handle_error"
+    status = state.get("approval_status")
+    if status == "confirmed":
+        return "enqueue_delivery"
+    return "format_output"
+
+
+def route_after_critique(state: AgentState) -> str:
+    """质检后：通过则继续后续流程，不通过则重生成。"""
+    MAX_REVIEW_ATTEMPTS = 3
+    if state.get("error_message"):
+        return "handle_error"
+    passed = state.get("critique_passed", True)
+    attempts = state.get("review_generation_attempts", 0)
+
+    if not passed and attempts < MAX_REVIEW_ATTEMPTS:
+        logger.info("质检不通过，第 %d 次重试生成评价", attempts)
+        return "retry"
+    if not passed:
+        logger.warning("质检不通过，已达最大重试次数 %d，强制放行", MAX_REVIEW_ATTEMPTS)
+
     if state.get("skip_image_generation"):
         return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+    if state.get("product_image_bytes"):
+        return "generate_images"
+    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
     if state.get("product_image_bytes"):
         return "generate_images"
     return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"

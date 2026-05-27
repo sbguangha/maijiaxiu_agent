@@ -21,12 +21,15 @@ from langgraph.types import Send
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+from config import settings
+from feishu_reader import fetch_all_source_rows, download_attachment, update_source_row_status
+from agent_graph_v2 import run_agent_v2
+
 logger = logging.getLogger("batch-graph")
 
 # =====================================================================
 # 并发控制
 # =====================================================================
-from config import settings  # pylint: disable=import-outside-toplevel
 
 _MAX_CONCURRENT_ROWS = int(os.getenv("BATCH_MAX_CONCURRENT", "3"))
 _ROW_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_ROWS)
@@ -55,8 +58,6 @@ class BatchState(TypedDict):
 
 def fetch_rows_node(state: BatchState) -> Dict[str, Any]:
     """读取飞书需求表，过滤出待处理行。"""
-    from feishu_reader import fetch_all_source_rows  # pylint: disable=import-outside-toplevel
-
     try:
         token, rows = fetch_all_source_rows()
         process_rows = [row for row in rows if row.should_process]
@@ -104,12 +105,6 @@ def map_rows(state: BatchState) -> List[Send]:
 
 def process_row_node(state: BatchState) -> Dict[str, Any]:
     """Reduc 阶段中的单行处理节点（通过 Send 并行调用）。"""
-    from feishu_reader import (  # pylint: disable=import-outside-toplevel
-        download_attachment,
-        update_source_row_status,
-    )
-    from agent_graph_v2 import run_agent_v2  # pylint: disable=import-outside-toplevel
-
     row = state.get("row")
     if row is None:
         logger.warning("[batch] process_row 接收到空 row，跳过")
@@ -148,7 +143,7 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                 target_contacts=contacts,
                 review_count=row.review_count,
                 image_count=row.image_count,
-                require_confirmation=False,
+                require_confirmation=state.get("require_confirmation", False),
             )
 
             if token:
@@ -208,6 +203,7 @@ def _build_batch_workflow() -> StateGraph:
 def _create_sqlite_checkpointer(db_path: str) -> SqliteSaver:
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     return SqliteSaver(conn)
 
 

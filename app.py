@@ -30,7 +30,9 @@ except Exception:
     try:
         from langgraph.types import GraphInterrupt
     except Exception:
-        GraphInterrupt = Exception
+        class GraphInterrupt(Exception):
+            """LangGraph interrupt signal -- raise when graph hits interrupt()."""
+            pass
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
@@ -305,33 +307,6 @@ async def chat_with_image(
             },
             status_code=200
         )
-
-
-def _task_to_dict_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """从 AgentState 字典中提取出 task 相关信息。"""
-    return {
-        "task_id": state.get("task_id"),
-        "target_contacts": state.get("target_contacts", []),
-        "review_text": state.get("reviews_formatted", ""),
-        "image_paths": state.get("local_image_paths", []),
-        "file_paths": [],
-        "status": "completed" if state.get("task_id") else "pending",
-    }
-    return {
-        "task_id": task.task_id,
-        "target_contacts": task.target_contacts,
-        "review_text": task.review_text,
-        "image_paths": task.image_paths,
-        "file_paths": task.file_paths,
-        "status": task.status,
-        "retry_count": task.retry_count,
-        "max_retry": task.max_retry,
-        "last_error": task.last_error,
-        "next_retry_at": task.next_retry_at.isoformat() if task.next_retry_at else None,
-        "created_at": task.created_at.isoformat(),
-        "updated_at": task.updated_at.isoformat(),
-        "reserved_by": task.reserved_by,
-    }
 
 
 def _task_to_dict_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -725,7 +700,7 @@ async def batch_generate_v2():
             run_batch_generate,
             batch_id=batch_id,
             default_contacts=default_contacts,
-            require_confirmation=False,
+            require_confirmation=REQUIRE_DELIVERY_CONFIRMATION,
         )
 
         return JSONResponse(content={

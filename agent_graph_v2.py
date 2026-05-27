@@ -17,6 +17,7 @@ from langgraph.types import Command
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+from config import settings
 from agent_state import AgentState
 from agent_nodes import (
     parse_input_node,
@@ -70,7 +71,7 @@ def _build_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "crawl_url",
         route_after_crawl,
-        {"extract_selling_points": "extract_selling_points"},
+        {"extract_selling_points": "extract_selling_points", "handle_error": "handle_error"},
     )
     workflow.add_edge("extract_selling_points", "generate_reviews")
 
@@ -80,12 +81,12 @@ def _build_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "generate_images",
         route_after_generate_images,
-        {"human_approval": "human_approval", "enqueue_delivery": "enqueue_delivery"},
+        {"human_approval": "human_approval", "enqueue_delivery": "enqueue_delivery", "handle_error": "handle_error"},
     )
     workflow.add_conditional_edges(
         "human_approval",
         route_after_human_approval,
-        {"enqueue_delivery": "enqueue_delivery", "format_output": "format_output"},
+        {"enqueue_delivery": "enqueue_delivery", "format_output": "format_output", "handle_error": "handle_error"},
     )
     workflow.add_edge("enqueue_delivery", "format_output")
     workflow.add_edge("format_output", END)
@@ -110,6 +111,7 @@ def _add_review_quality_loop(workflow: StateGraph) -> None:
             "generate_images": "generate_images",
             "human_approval": "human_approval",
             "enqueue_delivery": "enqueue_delivery",
+            "handle_error": "handle_error",
         },
     )
     workflow.add_conditional_edges(
@@ -130,9 +132,10 @@ def _add_review_quality_loop(workflow: StateGraph) -> None:
 
 
 def _create_sqlite_checkpointer(db_path: str) -> SqliteSaver:
-    """创建 SQLite Checkpointer。"""
+    """创建 SQLite Checkpointer（连接由 SqliteSaver 管理生命周期）。"""
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     return SqliteSaver(conn)
 
 
@@ -149,7 +152,6 @@ def build_agent_graph(
     if checkpointer is not None:
         return workflow.compile(checkpointer=checkpointer)
 
-    from config import settings  # pylint: disable=import-outside-toplevel
     try:
         cp = _create_sqlite_checkpointer(settings.paths.checkpoint_db)
         logger.info("Agent Graph 编译成功，使用 SQLite Checkpoint: %s", settings.paths.checkpoint_db)

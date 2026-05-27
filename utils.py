@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from config import settings
+
 logger = logging.getLogger("utils")
 
 
@@ -110,7 +112,6 @@ def materialize_generated_images(
     if not urls:
         return []
 
-    from config import settings  # pylint: disable=import-outside-toplevel
     generated_dir = output_dir or settings.paths.generated_image_dir
     os.makedirs(generated_dir, exist_ok=True)
 

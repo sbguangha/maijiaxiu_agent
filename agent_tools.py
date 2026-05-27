@@ -11,7 +11,6 @@ import logging
 import requests
 import json
 from bs4 import BeautifulSoup
-from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableSerializable
@@ -23,16 +22,12 @@ logger = logging.getLogger("agent-tools")
 _llm = create_moonshot_llm(temperature=0.7, max_retries=3)
 
 
-# ========== Tool: 链接解析器 ==========
+# ========== 链接解析器 ==========
 
-@tool
 def parse_product_url(url: str) -> str:
     """根据电商商品链接（淘宝、天猫、京东等），尝试抓取并返回商品的标题信息。
     
-    如果链接无法访问或被反爬虫拦截，会返回失败信息，此时你应该直接询问用户提供商品标题和卖点。
-    
-    Args:
-        url: 电商商品链接，例如 https://item.taobao.com/item.htm?id=xxx
+    如果链接无法访问或被反爬虫拦截，会返回失败信息。
     """
     try:
         headers = {
@@ -146,21 +141,16 @@ def _build_reviews_chain() -> RunnableSerializable:
 def _write_reviews_to_feishu(product_name: str, result_text: str) -> None:
     """将生成的评价批量写入飞书结果表。"""
     try:
-        feishu_app_id = settings.feishu.app_id
-        feishu_app_secret = settings.feishu.app_secret
+        from feishu_reader import get_tenant_access_token  # pylint: disable=import-outside-toplevel
+
         feishu_app_token = settings.feishu.app_token
         feishu_table_id = settings.feishu.table_id
 
-        if not all([feishu_app_id, feishu_app_secret, feishu_app_token, feishu_table_id]):
+        if not all([feishu_app_token, feishu_table_id]):
             return
 
-        token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-        token_resp = requests.post(token_url, json={"app_id": feishu_app_id, "app_secret": feishu_app_secret}).json()
+        token = get_tenant_access_token()
 
-        if token_resp.get("code") != 0:
-            return
-
-        token = token_resp.get("tenant_access_token")
         records = []
         blocks = re.split(r'评价\d+：?', result_text)
         for block in blocks:
@@ -188,7 +178,7 @@ def _write_reviews_to_feishu(product_name: str, result_text: str) -> None:
         logger.warning("写入飞书失败: %s", str(e))
 
 
-def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> str:
+def generate_reviews(product_name: str, selling_points: str, count: int = 5, write_feishu: bool = True) -> str:
     """根据商品名称和卖点，生成指定数量的真实风格买家评价。"""
     chain = _build_reviews_chain()
     result = ""
@@ -211,5 +201,6 @@ def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> 
                     return "生成评价失败（API过载），请稍后重试。"
                 raise
 
-    _write_reviews_to_feishu(product_name, result)
+    if write_feishu:
+        _write_reviews_to_feishu(product_name, result)
     return result

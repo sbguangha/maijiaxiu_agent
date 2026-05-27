@@ -17,6 +17,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from config import settings, create_moonshot_llm
+from feishu_reader import get_tenant_access_token as get_feishu_token
 
 logger = logging.getLogger("image-generator")
 
@@ -177,22 +178,7 @@ def generate_lifestyle_image_with_references(
     return None, ""
 
 
-# ========== 3. 飞书相关函数 ==========
-def get_feishu_token() -> str | None:
-    """获取飞书 tenant_access_token"""
-    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-    resp = requests.post(url, json={
-        "app_id": settings.feishu.app_id,
-        "app_secret": settings.feishu.app_secret
-    }).json()
-
-    if resp.get("code") == 0:
-        return resp.get("tenant_access_token")
-    logger.info(f"获取飞书 Token 失败: {resp}")
-    return None
-
-
-def upload_image_to_feishu(image_source, token: str, filename: str = "image.png") -> str | None:
+# ========== 飞书图片上传 ==========
     """
     将图片上传到飞书，返回 file_token。
     image_source 可以是：
@@ -327,9 +313,10 @@ def run_image_generation(
     }
 
     # Step 0: 获取飞书 Token
-    feishu_token = get_feishu_token()
-    if not feishu_token:
-        result["message"] = "❌ 获取飞书权限失败，请检查 App ID 和 Secret 配置"
+    try:
+        feishu_token = get_feishu_token()
+    except RuntimeError as e:
+        result["message"] = f"❌ 获取飞书权限失败：{e}"
         return result
 
     # Step 1: 上传用户的白底商品图到飞书

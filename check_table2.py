@@ -1,8 +1,6 @@
 import os
 import sys
 sys.path.insert(0, r'D:\1-品创\langchain')
-os.environ['FEISHU_APP_ID'] = 'cli_a9224ef54f779cd6'
-os.environ['FEISHU_APP_SECRET'] = 'r9sFp9EdfXSCef5HvJ64Cbt88WDk5nzY'
 
 from feishu_reader import get_tenant_access_token, list_source_records
 from dotenv import load_dotenv

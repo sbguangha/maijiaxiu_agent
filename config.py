@@ -134,10 +134,6 @@ class AppSettings(BaseSettings):
     outbox: OutboxSettings = Field(default_factory=OutboxSettings)
     paths: PathSettings = Field(default_factory=PathSettings)
 
-    # 向后兼容：允许通过 settings.get(key) 或 settings[key] 访问顶层环境变量
-    def get(self, key: str, default: str = "") -> str:
-        return os.getenv(key, default)
-
 
 # 全局单例
 settings = AppSettings()

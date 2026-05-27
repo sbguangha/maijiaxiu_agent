@@ -4,11 +4,8 @@ python-multipart
 python-dotenv
 requests
 pydantic
+pydantic-settings
 langchain-openai
 langchain-core
 langgraph
-pyautogui
-pyperclip
-pywin32
-pillow
 beautifulsoup4

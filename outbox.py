@@ -16,6 +16,9 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from config import settings
 
 UTC = timezone.utc
 _LOCK = threading.Lock()
@@ -277,7 +280,6 @@ def enqueue_task(
 
 
 def reserve_next_task(db_path: str, worker_id: str) -> OutboxTask | None:
-    from config import settings  # pylint: disable=import-outside-toplevel
     now = _utc_now()
     lease_timeout_sec = max(1, settings.outbox.processing_timeout_sec)
     stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
@@ -326,7 +328,6 @@ def peek_next_due_task(db_path: str) -> OutboxTask | None:
     """
     只查看下一条可处理任务，不改变任务状态。
     """
-    from config import settings  # pylint: disable=import-outside-toplevel
     now = _utc_now()
     lease_timeout_sec = max(1, settings.outbox.processing_timeout_sec)
     stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
@@ -667,7 +668,6 @@ def create_delivery_approval(
     max_retry: int = 4,
     extra: dict | None = None,
 ) -> DeliveryApproval:
-    from uuid import uuid4  # pylint: disable=import-outside-toplevel
 
     approval_id = f"apr_{uuid4().hex[:12]}"
     now = _utc_now()
