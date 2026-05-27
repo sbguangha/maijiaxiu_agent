@@ -348,6 +348,21 @@ def route_after_crawl(state: AgentState) -> str:
     return "extract_selling_points"
 
 
+def route_after_generate_reviews(state: AgentState) -> str:
+    """兼容旧版图：评价生成后继续配图/确认/入队。
+
+    新版图已改为 generate_reviews -> critique_reviews -> route_after_critique，
+    但部分旧代码仍可能导入这个路由名。
+    """
+    if state.get("error_message"):
+        return "handle_error"
+    if state.get("skip_image_generation"):
+        return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+    if state.get("product_image_bytes"):
+        return "generate_images"
+    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+
+
 def route_after_generate_images(state: AgentState) -> str:
     """生成配图后：如果需要人工确认则中断，否则直接入队。"""
     if state.get("error_message"):
@@ -381,44 +396,6 @@ def route_after_critique(state: AgentState) -> str:
     if not passed:
         logger.warning("质检不通过，已达最大重试次数 %d，强制放行", MAX_REVIEW_ATTEMPTS)
 
-    if state.get("skip_image_generation"):
-        return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
-    if state.get("product_image_bytes"):
-        return "generate_images"
-    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
-    if state.get("product_image_bytes"):
-        return "generate_images"
-    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
-
-
-def route_after_generate_images(state: AgentState) -> str:
-    """生成配图后：如果需要人工确认则中断，否则直接入队。"""
-    if state.get("require_confirmation"):
-        return "human_approval"
-    return "enqueue_delivery"
-
-
-def route_after_human_approval(state: AgentState) -> str:
-    """人工确认后：确认则入队，驳回则结束。"""
-    status = state.get("approval_status")
-    if status == "confirmed":
-        return "enqueue_delivery"
-    return "format_output"  # rejected 或其他状态直接结束
-
-
-def route_after_critique(state: AgentState) -> str:
-    """质检后：通过则继续后续流程（配图/确认/入队），不通过则重生成。"""
-    MAX_REVIEW_ATTEMPTS = 3
-    passed = state.get("critique_passed", True)
-    attempts = state.get("review_generation_attempts", 0)
-
-    if not passed and attempts < MAX_REVIEW_ATTEMPTS:
-        logger.info("质检不通过，第 %d 次重试生成评价", attempts)
-        return "retry"
-    if not passed:
-        logger.warning("质检不通过，已达最大重试次数 %d，强制放行", MAX_REVIEW_ATTEMPTS)
-
-    # 通过或强制放行：继续后续分流逻辑（和原 generate_reviews 后的分流一致）
     if state.get("skip_image_generation"):
         return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
     if state.get("product_image_bytes"):

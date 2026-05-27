@@ -98,6 +98,9 @@ def map_rows(state: BatchState) -> List[Send]:
             {
                 "row": row,
                 "feishu_token": state.get("feishu_token", ""),
+                "batch_id": state["batch_id"],
+                "default_contacts": state.get("default_contacts", []),
+                "require_confirmation": state.get("require_confirmation", False),
             },
         )
         for row in rows

@@ -33,7 +33,6 @@ from agent_nodes import (
     handle_error_node,
     route_after_parse_input,
     route_after_crawl,
-    route_after_generate_reviews,
     route_after_generate_images,
     route_after_human_approval,
     route_after_critique,
@@ -115,20 +114,6 @@ def _add_review_quality_loop(workflow: StateGraph) -> None:
             "handle_error": "handle_error",
         },
     )
-    workflow.add_conditional_edges(
-        "generate_images",
-        route_after_generate_images,
-        {"human_approval": "human_approval", "enqueue_delivery": "enqueue_delivery"},
-    )
-    workflow.add_conditional_edges(
-        "human_approval",
-        route_after_human_approval,
-        {"enqueue_delivery": "enqueue_delivery", "format_output": "format_output"},
-    )
-    workflow.add_edge("enqueue_delivery", "format_output")
-    workflow.add_edge("format_output", END)
-    workflow.add_edge("handle_error", END)
-
     return workflow
 
 

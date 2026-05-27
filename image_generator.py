@@ -179,6 +179,7 @@ def generate_lifestyle_image_with_references(
 
 
 # ========== 飞书图片上传 ==========
+def upload_image_to_feishu(image_source, token: str, filename: str = "image.png") -> str | None:
     """
     将图片上传到飞书，返回 file_token。
     image_source 可以是：
