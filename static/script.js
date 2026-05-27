@@ -97,7 +97,7 @@ async function startBatchGenerate() {
   setBadge('running', '生成中...');
 
   try {
-    const resp = await fetch('/batch-generate', { method: 'POST' });
+    const resp = await fetch('/batch-generate-v2', { method: 'POST' });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
@@ -117,6 +117,11 @@ async function startBatchGenerate() {
       await loadPendingApprovals();
     } else {
       setBadge('completed', `${successCount}/${total} 成功`);
+    }
+
+    // 显示 checkpoint 恢复提示
+    if (data.batch_id) {
+      progressText.textContent += ` (batch_id: ${data.batch_id}，支持中断恢复)`;
     }
   } catch (e) {
     progressText.textContent = `批量生成失败: ${e.message}`;
@@ -206,19 +211,24 @@ function renderApprovalArea(approvals) {
       imagesHtml += '</div>';
     }
 
+    // 判断是否有生成失败的标记
+    const hasError = (item.extra || {}).image_generation_failed;
+    const errorBadge = hasError ? '<span class="error-badge">生成失败</span>' : '';
+
     html += `<div class="approval-card" id="approval-${item.approval_id}">
       <div class="approval-card-header">
         <div>
-          <div class="approval-title">${escapeHtml(item.product_title || '未命名商品')}</div>
+          <div class="approval-title">${escapeHtml(item.product_title || '未命名商品')}${errorBadge}</div>
           <div class="approval-meta">联系人：${escapeHtml(contacts || '-')} ｜ 图片：${imagePaths.length} 张</div>
         </div>
         <div class="approval-actions">
-          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')">确认并发送</button>
+          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>确认并发送</button>
           <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">驳回</button>
         </div>
       </div>
       ${imagesHtml}
       <div class="approval-reviews">${reviewHtml || '<span class="approval-empty-hint">（无评价内容）</span>'}</div>
+      ${hasError ? '<div class="approval-error-hint">⚠️ 晒图生成失败，建议驳回后重新批量生成</div>' : ''}
     </div>`;
   });
   html += '</div>';
