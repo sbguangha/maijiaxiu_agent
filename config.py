@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from functools import lru_cache
 from typing import List
 
 from pydantic import Field
@@ -140,3 +141,20 @@ class AppSettings(BaseSettings):
 
 # 全局单例
 settings = AppSettings()
+
+
+# ============================================================
+# 共享 LLM 工厂（所有模块统一入口）
+# ============================================================
+
+@lru_cache(maxsize=4)
+def create_moonshot_llm(temperature: float = 0.7, max_retries: int = 3):
+    """创建 Kimi/Moonshot LLM 实例（带缓存，同参数复用同一实例）。"""
+    from langchain_openai import ChatOpenAI  # pylint: disable=import-outside-toplevel
+    return ChatOpenAI(
+        api_key=settings.llm.moonshot_api_key,
+        base_url=settings.llm.moonshot_base_url,
+        model=settings.llm.moonshot_model,
+        temperature=temperature,
+        max_retries=max_retries,
+    )

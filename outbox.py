@@ -277,8 +277,9 @@ def enqueue_task(
 
 
 def reserve_next_task(db_path: str, worker_id: str) -> OutboxTask | None:
+    from config import settings  # pylint: disable=import-outside-toplevel
     now = _utc_now()
-    lease_timeout_sec = int(os.getenv("OUTBOX_PROCESSING_TIMEOUT_SEC", "120") or "120")
+    lease_timeout_sec = max(1, settings.outbox.processing_timeout_sec)
     stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
     with _LOCK:
         with sqlite3.connect(db_path) as conn:
@@ -325,8 +326,9 @@ def peek_next_due_task(db_path: str) -> OutboxTask | None:
     """
     只查看下一条可处理任务，不改变任务状态。
     """
+    from config import settings  # pylint: disable=import-outside-toplevel
     now = _utc_now()
-    lease_timeout_sec = int(os.getenv("OUTBOX_PROCESSING_TIMEOUT_SEC", "120") or "120")
+    lease_timeout_sec = max(1, settings.outbox.processing_timeout_sec)
     stale_deadline = now - timedelta(seconds=max(1, lease_timeout_sec))
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row

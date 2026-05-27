@@ -1,33 +1,30 @@
 """
-V2.0 Agent 工具集
-定义三个 @tool 装饰器函数，供 LangGraph Agent 自主调用。
+Agent 工具集
+- parse_product_url: 爬取电商商品页面（@tool 装饰，可由 Agent 决策调用）
+- extract_selling_points: 从商品信息提取卖点（纯函数，由图节点调用）
+- generate_reviews: 生成买家评价（纯函数，由图节点调用）
 """
 
-import os
 import re
 import time
+import logging
 import requests
 import json
 from bs4 import BeautifulSoup
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
-from dotenv import load_dotenv
+from langchain_core.runnables import RunnableSerializable
 
-load_dotenv()
+from config import create_moonshot_llm, settings
 
-# 初始化一个共享的 LLM 实例，给需要调用模型的工具使用
-_llm = ChatOpenAI(
-    api_key=os.getenv("MOONSHOT_API_KEY"),
-    base_url="https://api.moonshot.cn/v1",
-    model="moonshot-v1-8k",
-    temperature=0.7,
-    max_retries=3,
-)
+logger = logging.getLogger("agent-tools")
+
+_llm = create_moonshot_llm(temperature=0.7, max_retries=3)
 
 
-# ========== Tool 1: 链接解析器 ==========
+# ========== Tool: 链接解析器 ==========
+
 @tool
 def parse_product_url(url: str) -> str:
     """根据电商商品链接（淘宝、天猫、京东等），尝试抓取并返回商品的标题信息。
@@ -48,16 +45,13 @@ def parse_product_url(url: str) -> str:
         
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # 提取标题
         title = soup.title.string.strip() if soup.title and soup.title.string else ""
         
-        # 尝试提取 meta description
         meta_desc = ""
         meta_tag = soup.find("meta", attrs={"name": "description"})
         if meta_tag and meta_tag.get("content"):
             meta_desc = meta_tag["content"].strip()
         
-        # 尝试提取 keywords
         keywords = ""
         kw_tag = soup.find("meta", attrs={"name": "keywords"})
         if kw_tag and kw_tag.get("content"):
@@ -77,16 +71,10 @@ def parse_product_url(url: str) -> str:
         return f"解析失败：无法访问链接 {url}，错误信息：{str(e)}。建议直接提供商品标题和卖点信息。"
 
 
-# ========== Tool 2: 卖点提取器 ==========
-@tool
-def extract_selling_points(product_info: str) -> str:
-    """根据商品标题和描述信息，利用 AI 分析并提取该商品的 3-5 个核心卖点。
-    
-    返回卖点列表，用顿号分隔。这些卖点将用于后续生成买家评价。
-    
-    Args:
-        product_info: 商品的标题、描述或关键词等文字信息。
-    """
+# ========== 卖点提取（纯函数） ==========
+
+def _build_selling_points_chain() -> RunnableSerializable:
+    """构建卖点提取 chain。"""
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一个资深的电商运营专家，专门分析服装服饰类商品的核心卖点。
 请根据提供的商品信息，提取出 3-5 个最能打动消费者的核心卖点。
@@ -98,10 +86,12 @@ def extract_selling_points(product_info: str) -> str:
 4. 只输出卖点，用顿号分隔，不要输出任何其他内容"""),
         ("user", "商品信息：{product_info}\n\n请提取核心卖点：")
     ])
-    
-    chain = prompt | _llm | StrOutputParser()
-    
-    # 自动重试机制
+    return prompt | _llm | StrOutputParser()
+
+
+def extract_selling_points(product_info: str) -> str:
+    """根据商品标题和描述信息，提取 3-5 个核心卖点（顿号分隔）。"""
+    chain = _build_selling_points_chain()
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -110,27 +100,18 @@ def extract_selling_points(product_info: str) -> str:
         except Exception as e:
             if "429" in str(e) and attempt < max_retries - 1:
                 wait_time = 5 * (attempt + 1)
-                print(f"  ⚠️ 提取卖点 API 过载，{wait_time} 秒后重试...")
+                logger.warning("提取卖点 API 过载，%d 秒后重试...", wait_time)
                 time.sleep(wait_time)
             else:
                 if attempt == max_retries - 1:
                     return f"提取卖点失败（API过载）：{str(e)}"
-                raise e
+                raise
 
 
-# ========== Tool 3: 评价生成器 ==========
-@tool
-def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> str:
-    """根据商品名称和卖点，生成指定数量的真实风格买家评价。
-    
-    生成的评价具有不同人设视角（微胖女孩、面料党、凑单型等），高度逼真，无 AI 痕迹。
-    每条评价包含评价正文和配图建议。
-    
-    Args:
-        product_name: 商品名称/标题
-        selling_points: 商品核心卖点，用顿号或逗号分隔
-        count: 要生成的评价条数，默认5条
-    """
+# ========== 评价生成（纯函数） ==========
+
+def _build_reviews_chain() -> RunnableSerializable:
+    """构建评价生成 chain。"""
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一个专业的淘宝/天猫【服装服饰类】"真实买家秀"生成引擎。
 你的任务是根据提供的商品信息，生成高度逼真、毫无 AI 痕迹的买家评价。
@@ -159,9 +140,57 @@ def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> 
 """),
         ("user", "商品名称：{product_name}\n商品卖点：{selling_points}\n\n请生成 {count} 条买家评价。")
     ])
-    
-    chain = prompt | _llm | StrOutputParser()
-    
+    return prompt | _llm | StrOutputParser()
+
+
+def _write_reviews_to_feishu(product_name: str, result_text: str) -> None:
+    """将生成的评价批量写入飞书结果表。"""
+    try:
+        feishu_app_id = settings.feishu.app_id
+        feishu_app_secret = settings.feishu.app_secret
+        feishu_app_token = settings.feishu.app_token
+        feishu_table_id = settings.feishu.table_id
+
+        if not all([feishu_app_id, feishu_app_secret, feishu_app_token, feishu_table_id]):
+            return
+
+        token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+        token_resp = requests.post(token_url, json={"app_id": feishu_app_id, "app_secret": feishu_app_secret}).json()
+
+        if token_resp.get("code") != 0:
+            return
+
+        token = token_resp.get("tenant_access_token")
+        records = []
+        blocks = re.split(r'评价\d+：?', result_text)
+        for block in blocks:
+            if not block.strip():
+                continue
+            content_match = re.search(r'内容：(.*?)(?=\n配图建议：|$)', block, re.DOTALL)
+            photo_match = re.search(r'配图建议：(.*?)(?=\n评价|$)', block, re.DOTALL)
+            if content_match:
+                records.append({
+                    "fields": {
+                        "商品名称": product_name,
+                        "评价内容": content_match.group(1).strip(),
+                        "配图建议": photo_match.group(1).strip() if photo_match else ""
+                    }
+                })
+
+        if records:
+            write_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{feishu_app_token}/tables/{feishu_table_id}/records/batch_create"
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8"
+            }
+            requests.post(write_url, headers=headers, json={"records": records})
+    except Exception as e:
+        logger.warning("写入飞书失败: %s", str(e))
+
+
+def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> str:
+    """根据商品名称和卖点，生成指定数量的真实风格买家评价。"""
+    chain = _build_reviews_chain()
     result = ""
     max_retries = 3
     for attempt in range(max_retries):
@@ -175,59 +204,12 @@ def generate_reviews(product_name: str, selling_points: str, count: int = 5) -> 
         except Exception as e:
             if "429" in str(e) and attempt < max_retries - 1:
                 wait_time = 5 * (attempt + 1)
-                print(f"  ⚠️ 生成评价 API 过载，{wait_time} 秒后重试...")
+                logger.warning("生成评价 API 过载，%d 秒后重试...", wait_time)
                 time.sleep(wait_time)
             else:
                 if attempt == max_retries - 1:
-                    return f"生成评价失败（API过载），请稍后重试。"
-                raise e
-    
-    # --- 自动回写飞书逻辑 ---
-    try:
-        FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
-        FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
-        FEISHU_APP_TOKEN = os.getenv("FEISHU_APP_TOKEN")
-        FEISHU_TABLE_ID = os.getenv("FEISHU_TABLE_ID")
-        
-        if all([FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_APP_TOKEN, FEISHU_TABLE_ID]):
-            # 1. 获取 token
-            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-            token_resp = requests.post(token_url, json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).json()
-            
-            if token_resp.get("code") == 0:
-                token = token_resp.get("tenant_access_token")
-                
-                # 2. 解析大模型返回的纯文本结果，提取成结构化字典
-                records = []
-                # 按照 "评价1：" "评价2：" 分块
-                blocks = re.split(r'评价\d+：?', result)
-                for block in blocks:
-                    if not block.strip(): 
-                        continue
-                    
-                    # 提取内容和配图建议
-                    content_match = re.search(r'内容：(.*?)(?=\n配图建议：|$)', block, re.DOTALL)
-                    photo_match = re.search(r'配图建议：(.*?)(?=\n评价|$)', block, re.DOTALL)
-                    
-                    if content_match:
-                        records.append({
-                            "fields": {
-                                "商品名称": product_name,
-                                "评价内容": content_match.group(1).strip(),
-                                "配图建议": photo_match.group(1).strip() if photo_match else ""
-                            }
-                        })
-                
-                # 3. 批量发送给飞书表格
-                if records:
-                    write_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records/batch_create"
-                    headers = {
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json; charset=utf-8"
-                    }
-                    requests.post(write_url, headers=headers, json={"records": records})
-    except Exception as e:
-        # 即使写入飞书失败，也不影响大模型把结果返回给前端用户
-        print(f"写入飞书失败: {str(e)}")
-        
+                    return "生成评价失败（API过载），请稍后重试。"
+                raise
+
+    _write_reviews_to_feishu(product_name, result)
     return result

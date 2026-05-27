@@ -13,14 +13,9 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
-from dotenv import load_dotenv
-
-load_dotenv()
+from config import settings
 
 logger = logging.getLogger("feishu-reader")
-
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 
 _BASE = "https://open.feishu.cn/open-apis"
 
@@ -41,11 +36,13 @@ class SourceRow:
 
 def get_tenant_access_token() -> str:
     """获取飞书 tenant_access_token，失败时抛异常。"""
-    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+    app_id = settings.feishu.app_id
+    app_secret = settings.feishu.app_secret
+    if not app_id or not app_secret:
         raise RuntimeError("FEISHU_APP_ID / FEISHU_APP_SECRET 未配置")
     resp = requests.post(
         f"{_BASE}/auth/v3/tenant_access_token/internal",
-        json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+        json={"app_id": app_id, "app_secret": app_secret},
         timeout=10,
     ).json()
     if resp.get("code") != 0:
@@ -165,8 +162,8 @@ def fetch_all_source_rows(
     一站式入口：获取 token -> 读取所有行 -> 解析。
     返回 (token, rows)，token 后续下载附件用。
     """
-    app_token = app_token or os.getenv("FEISHU_SOURCE_APP_TOKEN", "")
-    table_id = table_id or os.getenv("FEISHU_SOURCE_TABLE_ID", "")
+    app_token = app_token or settings.feishu.source_app_token
+    table_id = table_id or settings.feishu.source_table_id
     if not app_token or not table_id:
         raise RuntimeError("FEISHU_SOURCE_APP_TOKEN / FEISHU_SOURCE_TABLE_ID 未配置")
 
@@ -193,8 +190,8 @@ def update_source_row_status(
     """
     更新需求表某行的“处理状态”字段。
     """
-    app_token = app_token or os.getenv("FEISHU_SOURCE_APP_TOKEN", "")
-    table_id = table_id or os.getenv("FEISHU_SOURCE_TABLE_ID", "")
+    app_token = app_token or settings.feishu.source_app_token
+    table_id = table_id or settings.feishu.source_table_id
     if not app_token or not table_id:
         raise RuntimeError("FEISHU_SOURCE_APP_TOKEN / FEISHU_SOURCE_TABLE_ID 未配置")
     if not record_id:

@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import logging
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict, Union
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, CompiledStateGraph
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 logger = logging.getLogger("batch-graph")
 
@@ -22,12 +24,11 @@ class BatchState(TypedDict):
 
     batch_id: str
     feishu_token: Optional[str]
-    source_rows: List[Any]           # SourceRow 对象列表
+    source_rows: List[Any]
     current_index: int
     default_contacts: List[str]
     require_confirmation: bool
 
-    # 结果汇总
     batch_results: List[Dict[str, Any]]
     success_count: int
     error_count: int
@@ -99,7 +100,6 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
             batch_id, idx + 1, len(rows), row.product_title,
         )
 
-        # 下载商品平铺图
         image_bytes = None
         outfit_bytes_list: List[bytes] = []
         token = state.get("feishu_token", "")
@@ -110,7 +110,6 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                 if b and len(b) > 100:
                     outfit_bytes_list.append(b)
 
-        # 调用主图处理单行
         contacts = row.wechat_contacts or state.get("default_contacts", [])
         result = run_agent_v2(
             user_input=f"帮我生成{row.review_count}条评价，商品：{row.product_title}",
@@ -119,10 +118,9 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
             target_contacts=contacts,
             review_count=row.review_count,
             image_count=row.image_count,
-            require_confirmation=False,  # 批量模式跳过人工确认
+            require_confirmation=False,
         )
 
-        # 回写飞书状态
         if token:
             update_source_row_status(token, row.record_id, "已处理")
 
@@ -142,7 +140,6 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
         logger.exception("[batch-%s] [%d/%d] 失败: %s", batch_id, idx + 1, len(rows), row.product_title)
         row_result.update({"status": "error", "error": str(e)})
 
-    # 更新统计
     new_results = state.get("batch_results", []) + [row_result]
     success = sum(1 for r in new_results if r["status"] == "success")
     errors = sum(1 for r in new_results if r["status"] == "error")
@@ -171,55 +168,90 @@ def aggregate_node(state: BatchState) -> Dict[str, Any]:
     errors = state.get("error_count", 0)
     msg = f"批量处理完成：{success}/{total} 成功，{errors} 失败"
     logger.info("[batch-%s] %s", state["batch_id"], msg)
-    return {
-        "final_message": msg,
-    }
+    return {"final_message": msg}
 
 
 # =====================================================================
-# 构建批量子图
+# Graph 工厂函数
 # =====================================================================
 
-workflow = StateGraph(BatchState)
+def _build_batch_workflow() -> StateGraph:
+    """构建批量子图结构。"""
+    workflow = StateGraph(BatchState)
+    workflow.add_node("fetch_rows", fetch_rows_node)
+    workflow.add_node("process_row", process_row_node)
+    workflow.add_node("aggregate", aggregate_node)
+    workflow.set_entry_point("fetch_rows")
+    workflow.add_edge("fetch_rows", "process_row")
+    workflow.add_conditional_edges(
+        "process_row",
+        route_after_row,
+        {"next": "process_row", "done": "aggregate"},
+    )
+    workflow.add_edge("aggregate", END)
+    return workflow
 
-workflow.add_node("fetch_rows", fetch_rows_node)
-workflow.add_node("process_row", process_row_node)
-workflow.add_node("aggregate", aggregate_node)
 
-workflow.set_entry_point("fetch_rows")
-workflow.add_edge("fetch_rows", "process_row")
-workflow.add_conditional_edges(
-    "process_row",
-    route_after_row,
-    {"next": "process_row", "done": "aggregate"},
-)
-workflow.add_edge("aggregate", END)
+def _create_sqlite_checkpointer(db_path: str) -> SqliteSaver:
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    return SqliteSaver(conn)
 
-# Checkpoint
-from config import settings  # pylint: disable=import-outside-toplevel
-batch_checkpoint_db = settings.paths.batch_checkpoint_db
-os.makedirs(os.path.dirname(os.path.abspath(batch_checkpoint_db)), exist_ok=True)
+
+def build_batch_graph(
+    checkpointer: Union[SqliteSaver, MemorySaver, None] = None,
+) -> CompiledStateGraph:
+    """构建并编译批量处理图。
+
+    Args:
+        checkpointer: 可选自定义 checkpointer
+    """
+    workflow = _build_batch_workflow()
+
+    if checkpointer is not None:
+        return workflow.compile(checkpointer=checkpointer)
+
+    from config import settings  # pylint: disable=import-outside-toplevel
+    try:
+        cp = _create_sqlite_checkpointer(settings.paths.batch_checkpoint_db)
+        logger.info("Batch Graph 编译成功")
+        return workflow.compile(checkpointer=cp)
+    except Exception as e:
+        logger.warning("Batch Graph SQLite Checkpoint 失败 (%s)，回退到内存", e)
+        return workflow.compile(checkpointer=MemorySaver())
+
+
+# =====================================================================
+# 模块级懒加载单例（向后兼容）
+# =====================================================================
+
+_compiled_batch_graph: Optional[CompiledStateGraph] = None
+
+
+def _get_compiled_batch_graph() -> CompiledStateGraph:
+    global _compiled_batch_graph  # pylint: disable=global-statement
+    if _compiled_batch_graph is None:
+        _compiled_batch_graph = build_batch_graph()
+    return _compiled_batch_graph
+
+
 try:
-    _conn = __import__("sqlite3").connect(batch_checkpoint_db, check_same_thread=False)
-    batch_checkpointer = SqliteSaver(_conn)
-    compiled_batch_graph = workflow.compile(checkpointer=batch_checkpointer)
-    logger.info("Batch Graph 编译成功")
-except Exception as e:
-    logger.warning("Batch Graph SQLite Checkpoint 失败 (%s)，回退到内存", e)
-    from langgraph.checkpoint.memory import MemorySaver  # pylint: disable=import-outside-toplevel
-    batch_checkpointer = MemorySaver()
-    compiled_batch_graph = workflow.compile(checkpointer=batch_checkpointer)
+    compiled_batch_graph = build_batch_graph()
+except Exception:
+    compiled_batch_graph = build_batch_graph(checkpointer=MemorySaver())
 
+
+# =====================================================================
+# 对外 API
+# =====================================================================
 
 def run_batch_generate(
     batch_id: str,
     default_contacts: List[str],
     require_confirmation: bool = False,
+    graph: Optional[CompiledStateGraph] = None,
 ) -> Dict[str, Any]:
-    """启动批量生成流程。
-
-    返回最终 BatchState 字典（含 batch_results、final_message 等）。
-    """
+    """启动批量生成流程。"""
     initial_state: BatchState = {
         "batch_id": batch_id,
         "feishu_token": None,
@@ -234,8 +266,9 @@ def run_batch_generate(
         "error_message": None,
     }
     config = {"configurable": {"thread_id": batch_id}}
+    g = graph if graph is not None else _get_compiled_batch_graph()
     try:
-        result = compiled_batch_graph.invoke(initial_state, config=config)
+        result = g.invoke(initial_state, config=config)
         return dict(result)
     except Exception as e:
         logger.exception("批量生成异常")
@@ -246,11 +279,15 @@ def run_batch_generate(
         }
 
 
-def get_batch_state(batch_id: str) -> Optional[Dict[str, Any]]:
+def get_batch_state(
+    batch_id: str,
+    graph: Optional[CompiledStateGraph] = None,
+) -> Optional[Dict[str, Any]]:
     """查询某个 batch 的当前执行状态。"""
     config = {"configurable": {"thread_id": batch_id}}
+    g = graph if graph is not None else _get_compiled_batch_graph()
     try:
-        state = compiled_batch_graph.get_state(config)
+        state = g.get_state(config)
         if state:
             return dict(state.values)
         return None

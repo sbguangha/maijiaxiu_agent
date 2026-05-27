@@ -5,42 +5,41 @@ LangGraph Agent 全局状态定义
 
 from __future__ import annotations
 
-from typing import TypedDict, Annotated, List, Optional, Dict, Any
-import operator
+from typing import TypedDict, List, Optional, Dict, Any
 
 
 class AgentState(TypedDict):
-    """买家秀生成 Agent 的完整状态。
+    """买家秀生成 Agent 的单商品处理状态。
 
     设计原则：
     - 所有中间结果都显式放在 State 中，不依赖全局变量或闭包。
     - 控制流字段（crawl_success / skip_image_generation / error_message）
       供 conditional_edges 做路由决策。
+    - 批处理字段已移至 batch_graph.py 的 BatchState，职责分离。
     """
 
     # ========== 输入层 ==========
     user_input: str
     thread_id: str
 
-    # 外部传入的配置（可选，未传时走环境变量默认值）
     review_count: int
     image_count: int
     target_contacts: List[str]
-    product_image_bytes: Optional[bytes]          # 白底图二进制
-    outfit_image_bytes_list: List[bytes]          # 穿搭参考图二进制
-    require_confirmation: bool                    # 是否启用人工确认
+    product_image_bytes: Optional[bytes]
+    outfit_image_bytes_list: List[bytes]
+    require_confirmation: bool
 
     # ========== 商品信息层 ==========
     product_url: Optional[str]
-    product_info: Optional[str]                   # 爬取或用户提供的原始信息
+    product_info: Optional[str]
     product_name: Optional[str]
     selling_points: Optional[str]
 
     # ========== 生成结果层 ==========
-    reviews_raw: Optional[str]                    # LLM 原始输出
-    reviews_formatted: Optional[str]              # 格式化后的微信文案
-    image_result: Optional[Dict[str, Any]]        # image_generator 返回的完整 dict
-    local_image_paths: List[str]                  # 落地到本地的图片路径
+    reviews_raw: Optional[str]
+    reviews_formatted: Optional[str]
+    image_result: Optional[Dict[str, Any]]
+    local_image_paths: List[str]
 
     # ========== 质检层 ==========
     critique_result: Optional[str]
@@ -54,16 +53,10 @@ class AgentState(TypedDict):
     error_message: Optional[str]
 
     # ========== 人工确认层 ==========
-    approval_status: Optional[str]                # pending / confirmed / rejected
+    approval_status: Optional[str]
     approval_id: Optional[str]
     approval_note: Optional[str]
 
     # ========== 输出层 ==========
     task_id: Optional[str]
-    final_reply: Optional[str]                    # 返回给前端/用户的消息
-
-    # ========== 批量处理（Map-Reduce）==========
-    batch_id: Optional[str]
-    batch_results: Annotated[List[Dict[str, Any]], operator.add]
-    batch_total: int
-    batch_processed: int
+    final_reply: Optional[str]

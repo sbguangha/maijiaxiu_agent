@@ -6,37 +6,22 @@
   3. 将生成的图片上传到飞书，并写入多维表格
 """
 
-import os
 import re
 import json
 import time
 import base64
+import logging
 import requests
 import tempfile
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-load_dotenv()
+from config import settings, create_moonshot_llm
 
-# ========== 配置 ==========
-DOUBAO_API_KEY = os.getenv("DOUBAO_API_KEY")
-DOUBAO_API_URL = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
-
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
-FEISHU_APP_TOKEN = os.getenv("FEISHU_APP_TOKEN")
-FEISHU_TABLE_ID = os.getenv("FEISHU_TABLE_ID")
+logger = logging.getLogger("image-generator")
 
 # Kimi LLM（用于生成场景 Prompt）
-_llm = ChatOpenAI(
-    api_key=os.getenv("MOONSHOT_API_KEY"),
-    base_url="https://api.moonshot.cn/v1",
-    model="moonshot-v1-8k",
-    temperature=0.8,
-    max_retries=3,
-)
+_llm = create_moonshot_llm(temperature=0.8, max_retries=3)
 
 
 # ========== 1. 生成场景 Prompt ==========
@@ -80,10 +65,10 @@ def generate_scene_prompts(product_name: str, scene_count: int = 2) -> list[str]
         except Exception as e:
             if "429" in str(e) and attempt < max_retries - 1:
                 wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
-                print(f"  ⚠️ Kimi API 过载，{wait_time} 秒后自动重试（第 {attempt+1}/{max_retries} 次）...")
+                logger.info(f"  ⚠️ Kimi API 过载，{wait_time} 秒后自动重试（第 {attempt+1}/{max_retries} 次）...")
                 time.sleep(wait_time)
             else:
-                print(f"  ❌ Kimi 生成 Prompt 失败: {str(e)}")
+                logger.info(f"  ❌ Kimi 生成 Prompt 失败: {str(e)}")
                 return []
 
     # 解析结果：按行分割，去掉序号
@@ -109,34 +94,34 @@ def _image_bytes_to_data_uri(image_bytes: bytes, mime_type: str = "image/png") -
 def _post_doubao_payload(payload: dict) -> str | None:
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {DOUBAO_API_KEY}"
+        "Authorization": f"Bearer {settings.llm.doubao_api_key}"
     }
 
     try:
         # 自动重试（应对 429 过载错误）
         max_retries = 3
         for attempt in range(max_retries):
-            response = requests.post(DOUBAO_API_URL, headers=headers, json=payload, timeout=120)
+            response = requests.post(settings.llm.doubao_api_url, headers=headers, json=payload, timeout=120)
             data = response.json()
 
             # 检查是否 429 过载
             if response.status_code == 429 or data.get("error", {}).get("type") == "engine_overloaded_error":
                 if attempt < max_retries - 1:
                     wait_time = 10 * (attempt + 1)  # 10s, 20s, 30s
-                    print(f"  ⚠️ doubao API 过载，{wait_time} 秒后自动重试（第 {attempt+1}/{max_retries} 次）...")
+                    logger.info(f"  ⚠️ doubao API 过载，{wait_time} 秒后自动重试（第 {attempt+1}/{max_retries} 次）...")
                     time.sleep(wait_time)
                     continue
 
             if "data" in data and len(data["data"]) > 0:
                 return data["data"][0].get("url")
 
-            print(f"doubao 生图失败: {json.dumps(data, ensure_ascii=False)}")
+            logger.info(f"doubao 生图失败: {json.dumps(data, ensure_ascii=False)}")
             return None
 
-        print("doubao API 多次重试后仍失败")
+        logger.info("doubao API 多次重试后仍失败")
         return None
     except Exception as e:
-        print(f"doubao API 调用异常: {str(e)}")
+        logger.info(f"doubao API 调用异常: {str(e)}")
         return None
 
 
@@ -182,13 +167,13 @@ def generate_lifestyle_image_with_references(
     reference_images = [product_image_base64, outfit_image_base64]
     field_name = "image"
     payload = {**base_payload, field_name: reference_images}
-    print(f"  使用多图字段 {field_name} 进行双图参考生成，输入图片数={len(reference_images)}...")
+    logger.info(f"  使用多图字段 {field_name} 进行双图参考生成，输入图片数={len(reference_images)}...")
     url = _post_doubao_payload(payload)
     if url:
-        print(f"  ✅ 双图参考生成成功，使用字段: {field_name}")
+        logger.info(f"  ✅ 双图参考生成成功，使用字段: {field_name}")
         return url, field_name
 
-    print("  ⚠️ 双图参考生成失败，未回退到单商品图生图")
+    logger.info("  ⚠️ 双图参考生成失败，未回退到单商品图生图")
     return None, ""
 
 
@@ -197,13 +182,13 @@ def get_feishu_token() -> str | None:
     """获取飞书 tenant_access_token"""
     url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
     resp = requests.post(url, json={
-        "app_id": FEISHU_APP_ID,
-        "app_secret": FEISHU_APP_SECRET
+        "app_id": settings.feishu.app_id,
+        "app_secret": settings.feishu.app_secret
     }).json()
 
     if resp.get("code") == 0:
         return resp.get("tenant_access_token")
-    print(f"获取飞书 Token 失败: {resp}")
+    logger.info(f"获取飞书 Token 失败: {resp}")
     return None
 
 
@@ -219,7 +204,7 @@ def upload_image_to_feishu(image_source, token: str, filename: str = "image.png"
         if isinstance(image_source, str):
             img_resp = requests.get(image_source, timeout=30)
             if img_resp.status_code != 200:
-                print(f"下载图片失败: HTTP {img_resp.status_code}")
+                logger.info(f"下载图片失败: HTTP {img_resp.status_code}")
                 return None
             image_bytes = img_resp.content
         else:
@@ -240,7 +225,7 @@ def upload_image_to_feishu(image_source, token: str, filename: str = "image.png"
                 data = {
                     "file_name": filename,
                     "parent_type": "bitable_image",
-                    "parent_node": FEISHU_APP_TOKEN,
+                    "parent_node": settings.feishu.app_token,
                     "size": str(len(image_bytes))
                 }
                 resp = requests.post(upload_url, headers=headers, data=data, files=files, timeout=30)
@@ -249,13 +234,13 @@ def upload_image_to_feishu(image_source, token: str, filename: str = "image.png"
             if result.get("code") == 0:
                 return result["data"]["file_token"]
             else:
-                print(f"飞书上传失败: {json.dumps(result, ensure_ascii=False)}")
+                logger.info(f"飞书上传失败: {json.dumps(result, ensure_ascii=False)}")
                 return None
         finally:
             os.unlink(tmp_path)
 
     except Exception as e:
-        print(f"上传飞书异常: {str(e)}")
+        logger.info(f"上传飞书异常: {str(e)}")
         return None
 
 
@@ -267,7 +252,7 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
     - 商品主图：用户上传的白底图（附件）
     - ai生成的买家秀图片：doubao 生成的多张场景图（附件列表）
     """
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{FEISHU_APP_TOKEN}/tables/{FEISHU_TABLE_ID}/records"
+    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{settings.feishu.app_token}/tables/{settings.feishu.table_id}/records"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8"
@@ -291,13 +276,13 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         result = resp.json()
         if result.get("code") == 0:
-            print("✅ 飞书表格写入成功")
+            logger.info("✅ 飞书表格写入成功")
             return True
         else:
-            print(f"❌ 飞书写入失败: {json.dumps(result, ensure_ascii=False)}")
+            logger.info(f"❌ 飞书写入失败: {json.dumps(result, ensure_ascii=False)}")
             return False
     except Exception as e:
-        print(f"飞书写入异常: {str(e)}")
+        logger.info(f"飞书写入异常: {str(e)}")
         return False
 
 
@@ -348,7 +333,7 @@ def run_image_generation(
         return result
 
     # Step 1: 上传用户的白底商品图到飞书
-    print("📤 正在上传商品白底图到飞书...")
+    logger.info("📤 正在上传商品白底图到飞书...")
     product_image_token = upload_image_to_feishu(image_bytes, feishu_token, "product_main.png")
     if not product_image_token:
         result["message"] = "❌ 商品图上传飞书失败"
@@ -359,13 +344,13 @@ def run_image_generation(
 
     # Step 2: 生成提示词。存在穿搭参考图时使用固定强约束，减少模型自由发挥。
     if outfit_image_bytes_list:
-        print(f"🎨 检测到 {len(outfit_image_bytes_list)} 张穿搭参考图，使用双图参考生成...")
+        logger.info(f"🎨 检测到 {len(outfit_image_bytes_list)} 张穿搭参考图，使用双图参考生成...")
         prompts = [
             _build_outfit_reference_prompt(product_name, i + 1, scene_count)
             for i in range(scene_count)
         ]
     else:
-        print(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
+        logger.info(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
         prompts = generate_scene_prompts(product_name, scene_count)
     result["prompts"] = prompts
 
@@ -378,7 +363,7 @@ def run_image_generation(
     generated_urls = []
 
     for i, prompt in enumerate(prompts):
-        print(f"🖼️  正在生成第 {i+1}/{len(prompts)} 张配图: {prompt[:30]}...")
+        logger.info(f"🖼️  正在生成第 {i+1}/{len(prompts)} 张配图: {prompt[:30]}...")
 
         if outfit_image_bytes_list:
             outfit_bytes = outfit_image_bytes_list[i % len(outfit_image_bytes_list)]
@@ -406,7 +391,7 @@ def run_image_generation(
             if ai_token:
                 ai_image_tokens.append(ai_token)
         else:
-            print(f"  ⚠️ 第 {i+1} 张生成失败，跳过")
+            logger.info(f"  ⚠️ 第 {i+1} 张生成失败，跳过")
 
     result["image_urls"] = generated_urls
 
@@ -415,7 +400,7 @@ def run_image_generation(
         return result
 
     # Step 5: 写入飞书表格
-    print("📝 正在写入飞书表格...")
+    logger.info("📝 正在写入飞书表格...")
     success = write_to_feishu_table(product_name, product_image_token, ai_image_tokens, feishu_token)
 
     if success:

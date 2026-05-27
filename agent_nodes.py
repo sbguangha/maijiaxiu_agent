@@ -5,19 +5,17 @@ LangGraph Agent 节点集合
 
 from __future__ import annotations
 
-import os
-import re
-import time
 import logging
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-import requests
 
 from langgraph.types import interrupt
 
 from agent_state import AgentState
 from outbox import enqueue_task
+from utils import (
+    format_review_text_for_delivery,
+    materialize_generated_images,
+)
 
 logger = logging.getLogger("agent-nodes")
 
@@ -97,7 +95,7 @@ def extract_selling_points_node(state: AgentState) -> Dict[str, Any]:
         }
 
     try:
-        result = extract_selling_points.invoke({"product_info": product_info})
+        result = extract_selling_points(product_info)
         return {"selling_points": result}
     except Exception as e:
         logger.exception("提取卖点失败")
@@ -107,68 +105,6 @@ def extract_selling_points_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
-def _format_review_text_for_delivery(raw_text: Optional[str]) -> str:
-    """统一微信发送文案格式（从 app.py 迁移）。"""
-    text = (raw_text or "").replace("\r\n", "\n").strip()
-    if not text:
-        return ""
-
-    blocks: List[str] = []
-
-    # 1) 按“评价X”分段，优先提取“内容：...”
-    sections = re.split(r"(?:^|\n)\s*(?:\d+\.\s*)?(?:\*\*)?评价\s*\d+(?:\*\*)?\s*[：:]\s*", text)
-    if len(sections) > 1:
-        for section in sections[1:]:
-            m = re.search(
-                r"(?:^|\n)\s*(?:[-*]\s*)?(?:内容|正文)\s*[：:]\s*(.+?)(?=\n\s*(?:[-*]\s*)?(?:配图建议|图片建议)\s*[：:]|\Z)",
-                section,
-                re.S,
-            )
-            candidate = m.group(1) if m else section
-            normalized = _normalize_review_block(candidate)
-            if normalized:
-                blocks.append(normalized)
-
-    # 2) 兜底：直接抓取所有“内容：...”
-    if not blocks:
-        for m in re.finditer(
-            r"(?:^|\n)\s*(?:[-*]\s*)?(?:内容|正文)\s*[：:]\s*(.+?)(?=\n\s*(?:[-*]\s*)?(?:配图建议|图片建议|评价\s*\d+)\s*[：:]|\Z)",
-            text,
-            re.S,
-        ):
-            normalized = _normalize_review_block(m.group(1))
-            if normalized:
-                blocks.append(normalized)
-
-    # 3) 最后兜底：移除说明行后按段落拆
-    if not blocks:
-        kept_lines: List[str] = []
-        for line in text.splitlines():
-            if re.search(r"(以下是为您生成|配图建议|这些评价|评价\s*\d+)", line):
-                continue
-            kept_lines.append(line)
-        fallback = "\n".join(kept_lines).strip()
-        parts = [p.strip() for p in re.split(r"\n\s*\n", fallback) if p.strip()]
-        blocks = [_normalize_review_block(p) for p in parts if _normalize_review_block(p)]
-
-    if not blocks:
-        return text
-
-    sep = "\n—————————————\n"
-    return sep.join(blocks) + "\n—————————————"
-
-
-def _normalize_review_block(text: str) -> str:
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return ""
-    cleaned = re.sub(r"^\s*[-*]\s*", "", cleaned, flags=re.MULTILINE)
-    cleaned = cleaned.replace("**", "")
-    cleaned = re.sub(r"\n{2,}", "\n", cleaned)
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    return " ".join(lines).strip()
-
-
 def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
     """根据商品名和卖点生成买家评价。"""
     from agent_tools import generate_reviews  # pylint: disable=import-outside-toplevel
@@ -176,7 +112,6 @@ def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
     selling_points = state.get("selling_points") or ""
     count = state.get("review_count", 5)
 
-    # 构造 prompt
     prompt = f"帮我生成{count}条评价，商品：{product_name}"
     if selling_points:
         prompt += f"，卖点：{selling_points}"
@@ -187,12 +122,12 @@ def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
         prompt += f"\n\n【上一次质检反馈，请务必按此改进】\n{feedback}"
 
     try:
-        raw = generate_reviews.invoke({
-            "product_name": product_name,
-            "selling_points": selling_points,
-            "count": count,
-        })
-        formatted = _format_review_text_for_delivery(raw)
+        raw = generate_reviews(
+            product_name=product_name,
+            selling_points=selling_points,
+            count=count,
+        )
+        formatted = format_review_text_for_delivery(raw)
         return {
             "reviews_raw": raw,
             "reviews_formatted": formatted,
@@ -210,8 +145,8 @@ def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
 def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
     """质检节点：用 LLM 检查生成的评价是否有 AI 味。"""
     from langchain_core.prompts import ChatPromptTemplate
-    from langchain_openai import ChatOpenAI
     from langchain_core.output_parsers import StrOutputParser
+    from config import create_moonshot_llm  # pylint: disable=import-outside-toplevel
 
     reviews = state.get("reviews_raw", "")
     if not reviews:
@@ -221,15 +156,7 @@ def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
             "critique_feedback": None,
         }
 
-    # 使用统一配置
-    from config import settings  # pylint: disable=import-outside-toplevel
-    llm = ChatOpenAI(
-        api_key=settings.llm.moonshot_api_key,
-        base_url=settings.llm.moonshot_base_url,
-        model=settings.llm.moonshot_model,
-        temperature=0.3,
-        max_retries=2,
-    )
+    llm = create_moonshot_llm(temperature=0.3, max_retries=2)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一个专业的淘宝/天猫买家秀质检员，专门识别 AI 生成的虚假评价。
@@ -275,49 +202,6 @@ def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
         }
 
 
-def _materialize_generated_images(image_result: Optional[Dict[str, Any]]) -> List[str]:
-    """将 image_generator 返回的远程 URL 落地到本地，返回本地路径列表。"""
-    if not image_result or not isinstance(image_result, dict):
-        return []
-    urls = image_result.get("image_urls") or []
-    if not urls:
-        return []
-
-    from config import settings  # pylint: disable=import-outside-toplevel
-    generated_dir = settings.paths.generated_image_dir
-    os.makedirs(generated_dir, exist_ok=True)
-
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved_paths: List[str] = []
-    for idx, url in enumerate(urls, start=1):
-        try:
-            resp = requests.get(url, timeout=20)
-            resp.raise_for_status()
-            ext = _guess_ext(resp.headers.get("Content-Type", ""), url)
-            filename = f"ai_{now}_{idx}.{ext}"
-            path = os.path.join(generated_dir, filename)
-            with open(path, "wb") as f:
-                f.write(resp.content)
-            saved_paths.append(path)
-        except Exception as e:
-            logger.warning("下载生成图失败: %s, error=%s", url, e)
-    return saved_paths
-
-
-def _guess_ext(content_type: str, url: str) -> str:
-    ct = (content_type or "").lower()
-    if "png" in ct:
-        return "png"
-    if "jpeg" in ct or "jpg" in ct:
-        return "jpg"
-    if "webp" in ct:
-        return "webp"
-    tail = url.rsplit(".", 1)[-1].split("?", 1)[0].lower() if "." in url else ""
-    if tail in {"png", "jpg", "jpeg", "webp"}:
-        return "jpg" if tail == "jpeg" else tail
-    return "png"
-
-
 def generate_images_node(state: AgentState) -> Dict[str, Any]:
     """调用图生图模块生成买家秀配图。"""
     from image_generator import run_image_generation  # pylint: disable=import-outside-toplevel
@@ -348,7 +232,7 @@ def generate_images_node(state: AgentState) -> Dict[str, Any]:
         # 这里我们暂时只保存 URL，后续 enqueue 时再落地
         local_paths: List[str] = []
         if result and result.get("status") == "success":
-            local_paths = _materialize_generated_images(result)
+            local_paths = materialize_generated_images(result)
 
         return {
             "image_result": result,
@@ -435,6 +319,26 @@ def format_output_node(state: AgentState) -> Dict[str, Any]:
     return {
         "final_reply": reply,
     }
+
+
+def handle_error_node(state: AgentState) -> Dict[str, Any]:
+    """错误处理节点：收集错误信息，优雅降级。"""
+    error = state.get("error_message", "未知错误")
+    logger.error("流程异常终止: %s", error)
+    return {
+        "final_reply": f"⚠️ 处理失败：{error}",
+    }
+
+
+# =====================================================================
+# 错误路由
+# =====================================================================
+
+def route_on_error(state: AgentState) -> str:
+    """若 error_message 非空则进入错误处理。"""
+    if state.get("error_message"):
+        return "handle_error"
+    return "continue"
 
 
 # =====================================================================
