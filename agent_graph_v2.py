@@ -18,6 +18,11 @@ from langgraph.types import Command
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+try:
+    from langgraph.errors import GraphInterrupt
+except Exception:
+    from langgraph.types import GraphInterrupt
+
 from config import settings
 from agent_state import AgentState
 from agent_nodes import (
@@ -232,6 +237,8 @@ def run_agent_v2(
     try:
         result = g.invoke(initial_state, config=config)
         return dict(result)
+    except GraphInterrupt:
+        raise
     except Exception as e:
         logger.exception("Agent Graph V2 执行异常")
         return {

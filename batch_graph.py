@@ -22,6 +22,11 @@ from langgraph.types import Send
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+try:
+    from langgraph.errors import GraphInterrupt
+except Exception:
+    from langgraph.types import GraphInterrupt
+
 from config import settings
 from feishu_reader import fetch_all_source_rows, download_attachment, update_source_row_status
 from agent_graph_v2 import run_agent_v2
@@ -282,6 +287,8 @@ def run_batch_generate(
     try:
         result = g.invoke(initial_state, config=config)
         return dict(result)
+    except GraphInterrupt:
+        raise
     except Exception as e:
         logger.exception("批量生成异常")
         return {

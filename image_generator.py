@@ -11,6 +11,7 @@ import json
 import time
 import base64
 import logging
+import os
 import requests
 import tempfile
 from langchain_core.prompts import ChatPromptTemplate
