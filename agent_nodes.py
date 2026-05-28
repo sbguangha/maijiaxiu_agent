@@ -215,10 +215,10 @@ def generate_images_node(state: AgentState) -> Dict[str, Any]:
             product_name=product_name,
             scene_count=image_count,
             outfit_image_bytes_list=outfit_bytes_list if outfit_bytes_list else None,
+            commit_to_feishu=not state.get("defer_feishu_commit", False),
         )
         # 提取本地图片路径（从 image_result 中的 URL 落地）
-        # 但 run_image_generation 已经会写入飞书并返回 URL，
-        # 这里我们暂时只保存 URL，后续 enqueue 时再落地
+        # 批量图片审核模式会先保存候选图，审核通过后再写飞书和入队。
         local_paths: List[str] = []
         if result and result.get("status") == "success":
             local_paths = materialize_generated_images(result)

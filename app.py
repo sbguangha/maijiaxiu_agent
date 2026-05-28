@@ -382,6 +382,125 @@ def _create_delivery_approval(
     return approval.to_dict()
 
 
+def _is_image_review_approval(approval) -> bool:
+    return (approval.source == "batch-image-review") or (
+        (approval.extra or {}).get("approval_type") == "image_review"
+    )
+
+
+def _read_local_file_bytes(path: str) -> bytes:
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(f"本地候选文件不存在: {path}")
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _confirm_image_review_approval(existing, note: str):
+    """图片审核通过：写飞书结果表、更新源需求状态、入队微信发送。"""
+    from image_generator import commit_images_to_feishu
+    from feishu_reader import get_tenant_access_token, update_source_row_status
+
+    extra = existing.extra or {}
+    product_image_path = extra.get("product_image_path")
+    if not product_image_path:
+        raise RuntimeError("approval 缺少 product_image_path，无法写回飞书")
+    if not existing.image_paths:
+        raise RuntimeError("approval 缺少候选图片，无法写回飞书")
+
+    commit_result = commit_images_to_feishu(
+        existing.product_title,
+        product_image_path,
+        existing.image_paths,
+    )
+    if commit_result.get("status") != "success":
+        raise RuntimeError(commit_result.get("message") or "写入飞书失败")
+
+    source_record_id = extra.get("source_record_id")
+    if source_record_id:
+        try:
+            token = get_tenant_access_token()
+            update_source_row_status(token, source_record_id, "已处理")
+        except Exception as e:
+            logger.warning("更新源需求表状态失败，继续确认审核: %s", e)
+            commit_result["source_status_warning"] = str(e)
+
+    task_id = None
+    if existing.target_contacts:
+        task = enqueue_task(
+            db_path=OUTBOX_DB_PATH,
+            target_contacts=existing.target_contacts,
+            review_text=existing.review_text,
+            image_paths=existing.image_paths,
+            file_paths=existing.file_paths,
+            max_retry=existing.max_retry,
+        )
+        task_id = task.task_id
+
+    updated = db_confirm_approval(
+        OUTBOX_DB_PATH,
+        existing.approval_id,
+        note=note,
+        enqueue=False,
+        queued_task_id=task_id or "__no_delivery__",
+    )
+    if not updated:
+        raise RuntimeError("更新审核记录失败")
+    return updated, task_id, commit_result
+
+
+def _regenerate_image_review_approval(existing, note: str):
+    """图片审核驳回：保留原记录为 rejected，重新生成候选图并创建新 pending 记录。"""
+    from image_generator import run_image_generation
+
+    extra = existing.extra or {}
+    product_image_path = extra.get("product_image_path")
+    outfit_image_paths = extra.get("outfit_image_paths") or []
+
+    product_image_bytes = _read_local_file_bytes(product_image_path)
+    outfit_image_bytes_list = [
+        _read_local_file_bytes(path)
+        for path in outfit_image_paths
+        if path and os.path.isfile(path)
+    ]
+
+    image_result = run_image_generation(
+        image_bytes=product_image_bytes,
+        product_name=existing.product_title,
+        scene_count=int(extra.get("image_count") or max(len(existing.image_paths), 1)),
+        outfit_image_bytes_list=outfit_image_bytes_list or None,
+        commit_to_feishu=False,
+    )
+    if image_result.get("status") != "success":
+        raise RuntimeError(image_result.get("message") or "重新生成候选图片失败")
+
+    local_image_paths = materialize_generated_images(image_result)
+    if not local_image_paths:
+        raise RuntimeError("重新生成的候选图片未成功保存到本地")
+
+    db_reject_approval(OUTBOX_DB_PATH, existing.approval_id, note=note or "图片驳回，已重新生成")
+
+    new_extra = {
+        **extra,
+        "previous_approval_id": existing.approval_id,
+        "regenerate_count": int(extra.get("regenerate_count") or 0) + 1,
+        "image_reference_mode": image_result.get("reference_mode"),
+        "image_reference_fields": image_result.get("reference_fields", []),
+        "reject_note": note,
+    }
+    new_approval = db_create_approval(
+        OUTBOX_DB_PATH,
+        source=existing.source,
+        product_title=existing.product_title,
+        target_contacts=existing.target_contacts,
+        review_text=existing.review_text,
+        image_paths=local_image_paths,
+        file_paths=existing.file_paths,
+        max_retry=existing.max_retry,
+        extra=new_extra,
+    )
+    return new_approval, image_result
+
+
 @app.get("/outbox/tasks")
 async def get_outbox_tasks(
     limit: int = Query(default=50, ge=1, le=200),
@@ -449,6 +568,19 @@ async def confirm_delivery_approval(
             return JSONResponse(content={"approval": existing.to_dict(), "message": "already_confirmed"})
 
         note = payload.note if payload else ""
+        if _is_image_review_approval(existing):
+            updated, task_id, commit_result = await asyncio.to_thread(
+                _confirm_image_review_approval,
+                existing,
+                note,
+            )
+            return JSONResponse(content={
+                "approval": updated.to_dict(),
+                "task": {"task_id": task_id} if task_id else None,
+                "commit_result": commit_result,
+                "message": "queued" if task_id else "confirmed",
+            })
+
         thread_id = existing.extra.get("thread_id") if existing.extra else None
 
         # 如果存在 LangGraph thread_id，先恢复图执行（由图的 enqueue_delivery 节点入队）
@@ -493,6 +625,18 @@ async def reject_delivery_approval(
             return JSONResponse(content={"error": "approval_already_confirmed"}, status_code=400)
 
         note = payload.note if payload else ""
+        if _is_image_review_approval(existing):
+            new_approval, image_result = await asyncio.to_thread(
+                _regenerate_image_review_approval,
+                existing,
+                note,
+            )
+            return JSONResponse(content={
+                "approval": new_approval.to_dict(),
+                "image_result": image_result,
+                "message": "regenerated",
+            })
+
         thread_id = existing.extra.get("thread_id") if existing.extra else None
 
         # 如果存在 LangGraph thread_id，恢复图执行并驳回
@@ -706,6 +850,7 @@ async def batch_generate_v2():
         return JSONResponse(content={
             "batch_id": batch_id,
             "message": result.get("final_message", "完成"),
+            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
             "total": len(result.get("source_rows", [])),
             "success_count": result.get("success_count", 0),
             "error_count": result.get("error_count", 0),

@@ -13,7 +13,9 @@ import os
 import sqlite3
 import logging
 import threading
+from datetime import datetime
 from typing import Any, Dict, List, Optional, TypedDict, Annotated, Union
+from uuid import uuid4
 
 import operator
 from langgraph.graph import StateGraph, END
@@ -30,6 +32,7 @@ except Exception:
 from config import settings
 from feishu_reader import fetch_all_source_rows, download_attachment, update_source_row_status
 from agent_graph_v2 import run_agent_v2
+from outbox import create_delivery_approval
 
 logger = logging.getLogger("batch-graph")
 
@@ -39,6 +42,17 @@ logger = logging.getLogger("batch-graph")
 
 _MAX_CONCURRENT_ROWS = int(os.getenv("BATCH_MAX_CONCURRENT", "3"))
 _ROW_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_ROWS)
+
+
+def _save_candidate_bytes(data: bytes, prefix: str, ext: str = "png") -> str:
+    """把审核阶段需要复用的图片字节保存到本地候选目录。"""
+    os.makedirs(settings.paths.generated_image_dir, exist_ok=True)
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{now}_{uuid4().hex[:8]}.{ext}"
+    path = os.path.join(settings.paths.generated_image_dir, filename)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
 
 
 class BatchState(TypedDict):
@@ -136,24 +150,74 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
 
             image_bytes = None
             outfit_bytes_list: List[bytes] = []
+            product_image_path = ""
+            outfit_image_paths: List[str] = []
             token = state.get("feishu_token", "")
             if token and row.image_file_tokens:
                 image_bytes = download_attachment(token, row.image_file_tokens[0])
+                if image_bytes and len(image_bytes) > 100:
+                    product_image_path = _save_candidate_bytes(image_bytes, "product")
                 for outfit_token in row.outfit_image_file_tokens:
                     b = download_attachment(token, outfit_token)
                     if b and len(b) > 100:
                         outfit_bytes_list.append(b)
+                        outfit_image_paths.append(_save_candidate_bytes(b, "outfit"))
 
             contacts = row.wechat_contacts or state.get("default_contacts", [])
+            require_confirmation = state.get("require_confirmation", False)
             result = run_agent_v2(
                 user_input=f"帮我生成{row.review_count}条评价，商品：{row.product_title}",
                 product_image_bytes=image_bytes,
                 outfit_image_bytes_list=outfit_bytes_list,
-                target_contacts=contacts,
+                target_contacts=[] if require_confirmation else contacts,
                 review_count=row.review_count,
                 image_count=row.image_count,
-                require_confirmation=state.get("require_confirmation", False),
+                require_confirmation=False,
+                defer_feishu_commit=require_confirmation,
             )
+
+            if require_confirmation:
+                local_image_paths = result.get("local_image_paths", []) or []
+                if not local_image_paths:
+                    raise RuntimeError("候选图片未成功保存到本地，无法进入人工审核")
+
+                approval = create_delivery_approval(
+                    settings.outbox.db_path,
+                    source="batch-image-review",
+                    product_title=row.product_title,
+                    target_contacts=contacts,
+                    review_text=result.get("reviews_formatted", ""),
+                    image_paths=local_image_paths,
+                    file_paths=[],
+                    max_retry=4,
+                    extra={
+                        "approval_type": "image_review",
+                        "batch_id": batch_id,
+                        "source_record_id": row.record_id,
+                        "product_image_path": product_image_path,
+                        "outfit_image_paths": outfit_image_paths,
+                        "review_count": row.review_count,
+                        "image_count": row.image_count,
+                        "image_reference_mode": result.get("image_result", {}).get("reference_mode"),
+                        "image_reference_fields": result.get("image_result", {}).get("reference_fields", []),
+                        "regenerate_count": 0,
+                    },
+                )
+                if token:
+                    try:
+                        update_source_row_status(token, row.record_id, "待审核")
+                    except Exception as status_error:
+                        logger.warning("[batch-%s] 更新待审核状态失败: %s", batch_id, status_error)
+                row_result.update({
+                    "status": "pending_approval",
+                    "review_text": result.get("reviews_formatted", ""),
+                    "image_urls": result.get("image_result", {}).get("image_urls", []),
+                    "local_image_paths": local_image_paths,
+                    "approval_id": approval.approval_id,
+                    "task_id": None,
+                })
+                logger.info("[batch-%s] 已生成候选图，等待审核: %s", batch_id, row.product_title)
+                return {"row_results": [row_result]}
 
             if token:
                 update_source_row_status(token, row.record_id, "已处理")
@@ -182,12 +246,13 @@ def aggregate_node(state: BatchState) -> Dict[str, Any]:
     results = state.get("row_results", [])
     total = len(state.get("source_rows", []))
     success = sum(1 for r in results if r.get("status") == "success")
+    pending_approval = sum(1 for r in results if r.get("status") == "pending_approval")
     errors = sum(1 for r in results if r.get("status") == "error")
-    msg = f"批量处理完成：{success}/{total} 成功，{errors} 失败"
+    msg = f"批量处理完成：{success} 已完成，{pending_approval} 待审核，{errors} 失败，共 {total} 条"
     logger.info("[batch-%s] %s", state["batch_id"], msg)
     return {
         "final_message": msg,
-        "success_count": success,
+        "success_count": success + pending_approval,
         "error_count": errors,
     }
 

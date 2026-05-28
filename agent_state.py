@@ -28,6 +28,7 @@ class AgentState(TypedDict):
     product_image_bytes: Optional[bytes]
     outfit_image_bytes_list: List[bytes]
     require_confirmation: bool
+    defer_feishu_commit: bool
 
     # ========== 商品信息层 ==========
     product_url: Optional[str]

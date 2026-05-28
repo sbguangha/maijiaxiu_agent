@@ -109,11 +109,13 @@ async function startBatchGenerate() {
     const successCount = data.success_count || 0;
 
     progressBar.style.width = '100%';
-    progressText.textContent = `完成: ${successCount}/${total} 成功`;
+    progressText.textContent = requireConfirmation
+      ? `完成: ${successCount}/${total} 已生成，等待人工审核`
+      : `完成: ${successCount}/${total} 成功`;
 
     updateTableWithResults(results);
     if (requireConfirmation) {
-      setBadge('completed', `${successCount}/${total} 已生成，待确认发送`);
+      setBadge('completed', `${successCount}/${total} 已生成，待审核图片`);
       await loadPendingApprovals();
     } else {
       setBadge('completed', `${successCount}/${total} 成功`);
@@ -141,11 +143,13 @@ function updateTableWithResults(results) {
     const statusCell = cells[6];
     const noteCell = cells[7];
 
-    if (r.status === 'success') {
-      statusCell.innerHTML = '<span class="row-status success">成功</span>';
+    if (r.status === 'success' || r.status === 'pending_approval') {
+      statusCell.innerHTML = r.status === 'pending_approval'
+        ? '<span class="row-status pending">待审核</span>'
+        : '<span class="row-status success">成功</span>';
       const parts = [];
       if (r.approval_id) {
-        parts.push(`待确认(${r.approval_id})`);
+        parts.push(`待审核(${r.approval_id})`);
       } else if (r.queued_task_id) {
         parts.push('已入队');
       }
@@ -176,7 +180,7 @@ async function loadPendingApprovals() {
     renderApprovalArea(approvals);
   } catch (e) {
     approvalArea.classList.remove('hidden');
-    approvalArea.innerHTML = `<div class="approval-header">待确认发送</div><div class="approval-empty">读取待确认列表失败: ${escapeHtml(e.message)}</div>`;
+    approvalArea.innerHTML = `<div class="approval-header">待审核图片</div><div class="approval-empty">读取待审核列表失败: ${escapeHtml(e.message)}</div>`;
   }
 }
 
@@ -189,16 +193,19 @@ function renderApprovalArea(approvals) {
 
   approvalArea.classList.remove('hidden');
   if (!approvals.length) {
-    approvalArea.innerHTML = '<div class="approval-header">待确认发送</div><div class="approval-empty">暂无待确认任务</div>';
+    approvalArea.innerHTML = '<div class="approval-header">待审核图片</div><div class="approval-empty">暂无待审核任务</div>';
     return;
   }
 
-  let html = `<div class="approval-header">待确认发送（${approvals.length}）</div>`;
+  let html = `<div class="approval-header">待审核图片（${approvals.length}）</div>`;
   html += '<div class="approval-list">';
   approvals.forEach((item) => {
     const contacts = (item.target_contacts || []).join(', ');
     const reviewHtml = formatReviewText(item.review_text || '');
     const imagePaths = item.image_paths || [];
+    const approvalType = (item.extra || {}).approval_type;
+    const isImageReview = approvalType === 'image_review';
+    const regenerateCount = (item.extra || {}).regenerate_count || 0;
 
     let imagesHtml = '';
     if (imagePaths.length > 0) {
@@ -219,11 +226,11 @@ function renderApprovalArea(approvals) {
       <div class="approval-card-header">
         <div>
           <div class="approval-title">${escapeHtml(item.product_title || '未命名商品')}${errorBadge}</div>
-          <div class="approval-meta">联系人：${escapeHtml(contacts || '-')} ｜ 图片：${imagePaths.length} 张</div>
+          <div class="approval-meta">联系人：${escapeHtml(contacts || '-')} ｜ 图片：${imagePaths.length} 张${regenerateCount ? ` ｜ 已重生成 ${regenerateCount} 次` : ''}</div>
         </div>
         <div class="approval-actions">
-          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>确认并发送</button>
-          <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">驳回</button>
+          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>${isImageReview ? '审核通过' : '确认并发送'}</button>
+          <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">${isImageReview ? '驳回并重生成' : '驳回'}</button>
         </div>
       </div>
       ${imagesHtml}
@@ -254,12 +261,12 @@ function formatReviewText(text) {
 }
 
 async function confirmApproval(approvalId) {
-  const note = window.prompt('确认发送备注（可选）', '') || '';
+  const note = window.prompt('审核通过备注（可选）', '') || '';
   await approveAction(approvalId, 'confirm', note);
 }
 
 async function rejectApproval(approvalId) {
-  const note = window.prompt('驳回原因（可选）', '') || '';
+  const note = window.prompt('驳回原因（可选，会立即重新生成一组候选图）', '') || '';
   await approveAction(approvalId, 'reject', note);
 }
 

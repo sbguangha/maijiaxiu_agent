@@ -189,6 +189,7 @@ def run_agent_v2(
     review_count: int = 5,
     image_count: int = 2,
     require_confirmation: bool = False,
+    defer_feishu_commit: bool = False,
     graph: Optional[CompiledStateGraph] = None,
 ) -> Dict[str, Any]:
     """运行完整的买家秀生成图。
@@ -213,6 +214,7 @@ def run_agent_v2(
         "product_image_bytes": product_image_bytes,
         "outfit_image_bytes_list": outfit_image_bytes_list or [],
         "require_confirmation": require_confirmation,
+        "defer_feishu_commit": defer_feishu_commit,
         "reviews_raw": None,
         "reviews_formatted": None,
         "image_result": None,

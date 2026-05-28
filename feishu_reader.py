@@ -261,7 +261,7 @@ def _is_todo_status(status_text: str) -> bool:
     normalized = (status_text or "").strip().replace(" ", "")
     if not normalized:
         return True
-    if normalized in {"已处理", "完成", "completed", "done"}:
+    if normalized in {"已处理", "完成", "待审核", "审核中", "completed", "done"}:
         return False
     if normalized in {"待处理", "未处理", "pending", "todo"}:
         return True

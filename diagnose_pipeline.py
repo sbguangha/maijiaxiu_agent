@@ -345,11 +345,18 @@ def check_agent_generate_images_node_safe_path() -> str:
 
     captured: dict[str, Any] = {}
 
-    def fake_run_image_generation(image_bytes: bytes, product_name: str, scene_count: int, outfit_image_bytes_list=None):
+    def fake_run_image_generation(
+        image_bytes: bytes,
+        product_name: str,
+        scene_count: int,
+        outfit_image_bytes_list=None,
+        commit_to_feishu: bool = True,
+    ):
         captured["image_bytes_len"] = len(image_bytes)
         captured["product_name"] = product_name
         captured["scene_count"] = scene_count
         captured["outfit_count"] = len(outfit_image_bytes_list or [])
+        captured["commit_to_feishu"] = commit_to_feishu
         return {
             "status": "success",
             "image_urls": ["https://example.com/a.jpg"],
@@ -367,6 +374,7 @@ def check_agent_generate_images_node_safe_path() -> str:
                 "image_count": 1,
                 "product_image_bytes": b"product",
                 "outfit_image_bytes_list": [b"outfit"],
+                "defer_feishu_commit": True,
             })
 
     if result.get("error_message"):
@@ -375,7 +383,9 @@ def check_agent_generate_images_node_safe_path() -> str:
         raise RuntimeError(f"generate_images_node 未传递穿搭图: {captured}")
     if not result.get("local_image_paths"):
         raise RuntimeError("local_image_paths 为空")
-    return "agent_nodes.generate_images_node 正确传递 outfit_image_bytes_list"
+    if captured.get("commit_to_feishu") is not False:
+        raise RuntimeError(f"defer_feishu_commit 未生效: {captured}")
+    return "agent_nodes.generate_images_node 正确传递 outfit_image_bytes_list 且支持候选图模式"
 
 
 def check_batch_process_row_safe_path() -> str:

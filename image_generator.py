@@ -190,11 +190,15 @@ def upload_image_to_feishu(image_source, token: str, filename: str = "image.png"
     try:
         # 如果是 URL，先下载到内存
         if isinstance(image_source, str):
-            img_resp = requests.get(image_source, timeout=30)
-            if img_resp.status_code != 200:
-                logger.info(f"下载图片失败: HTTP {img_resp.status_code}")
-                return None
-            image_bytes = img_resp.content
+            if os.path.isfile(image_source):
+                with open(image_source, "rb") as f:
+                    image_bytes = f.read()
+            else:
+                img_resp = requests.get(image_source, timeout=30)
+                if img_resp.status_code != 200:
+                    logger.info(f"下载图片失败: HTTP {img_resp.status_code}")
+                    return None
+                image_bytes = img_resp.content
         else:
             image_bytes = image_source
 
@@ -274,6 +278,53 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
         return False
 
 
+def commit_images_to_feishu(
+    product_name: str,
+    product_image_source,
+    generated_image_sources: list,
+) -> dict:
+    """审核通过后，把商品图和候选买家秀图写回飞书结果表。"""
+    result = {
+        "status": "error",
+        "message": "",
+        "product_image_token": None,
+        "ai_image_tokens": [],
+    }
+
+    try:
+        feishu_token = get_feishu_token()
+    except RuntimeError as e:
+        result["message"] = f"❌ 获取飞书权限失败：{e}"
+        return result
+
+    logger.info("📤 审核通过，正在上传商品图到飞书...")
+    product_image_token = upload_image_to_feishu(product_image_source, feishu_token, "product_main.png")
+    if not product_image_token:
+        result["message"] = "❌ 商品图上传飞书失败"
+        return result
+
+    ai_image_tokens = []
+    for idx, image_source in enumerate(generated_image_sources, start=1):
+        token = upload_image_to_feishu(image_source, feishu_token, f"lifestyle_{idx}.png")
+        if token:
+            ai_image_tokens.append(token)
+
+    if not ai_image_tokens:
+        result["message"] = "❌ 候选买家秀图上传飞书失败"
+        return result
+
+    success = write_to_feishu_table(product_name, product_image_token, ai_image_tokens, feishu_token)
+    result["product_image_token"] = product_image_token
+    result["ai_image_tokens"] = ai_image_tokens
+    if success:
+        result["status"] = "success"
+        result["message"] = f"🎉 审核通过，已写入 {len(ai_image_tokens)} 张买家秀图到飞书"
+    else:
+        result["status"] = "partial"
+        result["message"] = "⚠️ 图片已上传，但写入飞书表格失败"
+    return result
+
+
 # ========== 4. 主流程编排 ==========
 def _build_outfit_reference_prompt(product_name: str, index: int, total: int) -> str:
     return (
@@ -293,15 +344,14 @@ def run_image_generation(
     product_name: str,
     scene_count: int = 2,
     outfit_image_bytes_list: list[bytes] | None = None,
+    commit_to_feishu: bool = True,
 ) -> dict:
     """
     完整的图片生成主流程：
-    1. 上传白底图到飞书
-    2. 如果存在穿搭参考图，则使用商品图 + 单张穿搭图双图参考生成
+    1. 如果存在穿搭参考图，则使用商品图 + 单张穿搭图双图参考生成
        否则保留旧的 Kimi 场景 Prompt + 单图生图逻辑
-    3. doubao 逐个生成买家秀图
-    4. 每张场景图上传飞书
-    5. 写入飞书表格
+    2. doubao 逐个生成买家秀图
+    3. commit_to_feishu=True 时写入飞书；False 时只返回候选图 URL
     """
     outfit_image_bytes_list = outfit_image_bytes_list or []
     result = {
@@ -312,21 +362,8 @@ def run_image_generation(
         "reference_mode": "product_plus_outfit" if outfit_image_bytes_list else "product_only",
         "outfit_reference_count": len(outfit_image_bytes_list),
         "reference_fields": [],
+        "committed_to_feishu": False,
     }
-
-    # Step 0: 获取飞书 Token
-    try:
-        feishu_token = get_feishu_token()
-    except RuntimeError as e:
-        result["message"] = f"❌ 获取飞书权限失败：{e}"
-        return result
-
-    # Step 1: 上传用户的白底商品图到飞书
-    logger.info("📤 正在上传商品白底图到飞书...")
-    product_image_token = upload_image_to_feishu(image_bytes, feishu_token, "product_main.png")
-    if not product_image_token:
-        result["message"] = "❌ 商品图上传飞书失败"
-        return result
 
     # 构造 base64 数据 URI（飞书链接需要认证，所以用 base64 代替）
     product_image_base64 = _image_bytes_to_data_uri(image_bytes)
@@ -347,8 +384,7 @@ def run_image_generation(
         result["message"] = "❌ 生成场景描述失败"
         return result
 
-    # Step 3 & 4: 用 doubao 生成场景图并上传飞书
-    ai_image_tokens = []
+    # Step 3: 用 doubao 生成场景图。是否写飞书由后续 commit_to_feishu 决定。
     generated_urls = []
 
     for i, prompt in enumerate(prompts):
@@ -374,11 +410,6 @@ def run_image_generation(
             gen_url = generate_lifestyle_image(strict_prompt, product_image_base64)
         if gen_url:
             generated_urls.append(gen_url)
-
-            # 上传生成的图片到飞书
-            ai_token = upload_image_to_feishu(gen_url, feishu_token, f"lifestyle_{i+1}.png")
-            if ai_token:
-                ai_image_tokens.append(ai_token)
         else:
             logger.info(f"  ⚠️ 第 {i+1} 张生成失败，跳过")
 
@@ -388,16 +419,20 @@ def run_image_generation(
         result["message"] = "❌ 所有场景图生成均失败，请检查 DOUBAO_API_KEY 是否正确"
         return result
 
-    # Step 5: 写入飞书表格
-    logger.info("📝 正在写入飞书表格...")
-    success = write_to_feishu_table(product_name, product_image_token, ai_image_tokens, feishu_token)
-
-    if success:
+    if not commit_to_feishu:
         result["status"] = "success"
+        result["message"] = f"✅ 成功生成 {len(generated_urls)} 张待审核买家秀图，尚未写入飞书"
+        return result
+
+    commit_result = commit_images_to_feishu(product_name, image_bytes, generated_urls)
+
+    if commit_result.get("status") == "success":
+        result["status"] = "success"
+        result["committed_to_feishu"] = True
         result["message"] = f"🎉 成功生成 {len(generated_urls)} 张买家秀配图，已写入飞书表格！"
     else:
-        result["status"] = "partial"
-        result["message"] = f"⚠️ 生成了 {len(generated_urls)} 张配图，但写入飞书失败"
+        result["status"] = commit_result.get("status", "partial")
+        result["message"] = commit_result.get("message") or f"⚠️ 生成了 {len(generated_urls)} 张配图，但写入飞书失败"
 
     return result
 
