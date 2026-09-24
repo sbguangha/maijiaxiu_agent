@@ -68,6 +68,7 @@ from utils import (
     guess_image_ext,
     parse_target_contacts,
 )
+from buyer_show_review import chosen_attempts
 import uvicorn
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -469,6 +470,8 @@ def _regenerate_image_review_approval(existing, note: str):
         scene_count=int(extra.get("image_count") or max(len(existing.image_paths), 1)),
         outfit_image_bytes_list=outfit_image_bytes_list or None,
         commit_to_feishu=False,
+        prior_attempts=chosen_attempts(extra.get("image_attempts")),
+        note=note or "",
     )
     if image_result.get("status") != "success":
         raise RuntimeError(image_result.get("message") or "重新生成候选图片失败")
@@ -485,6 +488,7 @@ def _regenerate_image_review_approval(existing, note: str):
         "regenerate_count": int(extra.get("regenerate_count") or 0) + 1,
         "image_reference_mode": image_result.get("reference_mode"),
         "image_reference_fields": image_result.get("reference_fields", []),
+        "image_attempts": image_result.get("attempts", []),
         "reject_note": note,
     }
     new_approval = db_create_approval(

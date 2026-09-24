@@ -34,6 +34,13 @@ class LLMSettings(BaseSettings):
     moonshot_base_url: str = Field(default="https://api.moonshot.cn/v1", alias="MOONSHOT_BASE_URL")
     moonshot_model: str = Field(default="moonshot-v1-8k", alias="MOONSHOT_MODEL")
 
+    dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
+    dashscope_base_url: str = Field(
+        default="https://maas.qianwenaiapi.com/compatible-mode/v1",
+        alias="DASHSCOPE_BASE_URL",
+    )
+    vision_model: str = Field(default="qwen3.8-omni-flash", alias="QWEN_VISION_MODEL")
+
     doubao_api_key: str = Field(default="", alias="DOUBAO_API_KEY")
     doubao_api_url: str = Field(
         default="https://ark.cn-beijing.volces.com/api/v3/images/generations",

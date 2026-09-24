@@ -33,6 +33,8 @@ from config import settings
 from feishu_reader import fetch_all_source_rows, download_attachment, update_source_row_status
 from agent_graph_v2 import run_agent_v2
 from outbox import create_delivery_approval
+from buyer_show_review import decide_delivery
+from image_generator import commit_images_to_feishu
 
 logger = logging.getLogger("batch-graph")
 
@@ -176,7 +178,37 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                 defer_feishu_commit=require_confirmation,
             )
 
+            image_result = result.get("image_result") or {}
+            image_attempts = image_result.get("attempts") or []
+
             if require_confirmation:
+                decision = decide_delivery(
+                    image_result,
+                    requested_count=row.image_count,
+                    require_confirmation=True,
+                )
+                if decision == "auto_accept":
+                    commit_result = commit_images_to_feishu(
+                        row.product_title,
+                        product_image_path or image_bytes,
+                        result.get("local_image_paths") or image_result.get("image_urls") or [],
+                    )
+                    if commit_result.get("status") != "success":
+                        raise RuntimeError(commit_result.get("message") or "评审通过后写入飞书失败")
+                    if token:
+                        update_source_row_status(token, row.record_id, "已处理")
+                    row_result.update({
+                        "status": "success",
+                        "review_text": result.get("reviews_formatted", ""),
+                        "image_urls": image_result.get("image_urls", []),
+                        "local_image_paths": result.get("local_image_paths", []) or [],
+                        "image_attempts": image_attempts,
+                        "auto_accepted": True,
+                        "task_id": None,
+                    })
+                    logger.info("[batch-%s] 评审全部通过，已自动收下: %s", batch_id, row.product_title)
+                    return {"row_results": [row_result]}
+
                 local_image_paths = result.get("local_image_paths", []) or []
                 if not local_image_paths:
                     raise RuntimeError("候选图片未成功保存到本地，无法进入人工审核")
@@ -200,6 +232,7 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                         "image_count": row.image_count,
                         "image_reference_mode": result.get("image_result", {}).get("reference_mode"),
                         "image_reference_fields": result.get("image_result", {}).get("reference_fields", []),
+                        "image_attempts": image_attempts,
                         "regenerate_count": 0,
                     },
                 )
@@ -213,6 +246,7 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                     "review_text": result.get("reviews_formatted", ""),
                     "image_urls": result.get("image_result", {}).get("image_urls", []),
                     "local_image_paths": local_image_paths,
+                    "image_attempts": image_attempts,
                     "approval_id": approval.approval_id,
                     "task_id": None,
                 })
@@ -225,11 +259,9 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
             row_result.update({
                 "status": "success",
                 "review_text": result.get("reviews_formatted", ""),
-                "image_urls": (
-                    result.get("image_result", {}).get("image_urls", [])
-                    if result.get("image_result")
-                    else []
-                ),
+                "image_urls": image_result.get("image_urls", []),
+                "local_image_paths": result.get("local_image_paths", []) or [],
+                "image_attempts": image_attempts,
                 "task_id": result.get("task_id"),
             })
             logger.info("[batch-%s] 完成: %s", batch_id, row.product_title)
