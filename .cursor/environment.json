@@ -1,0 +1,16 @@
+{
+  "name": "买家秀生成 Agent (FastAPI + LangGraph)",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "app-server",
+      "command": "./venv/bin/python app.py"
+    }
+  ],
+  "ports": [
+    {
+      "name": "web",
+      "port": 8000
+    }
+  ]
+}
