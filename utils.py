@@ -101,6 +101,22 @@ def guess_image_ext(content_type: str, url: str) -> str:
     return "png"
 
 
+def save_generated_bytes(
+    content: bytes,
+    prefix: str = "ai",
+    ext: str = "png",
+    output_dir: Optional[str] = None,
+) -> str:
+    """把生成图字节存进 generated_images，返回本地路径。"""
+    generated_dir = output_dir or settings.paths.generated_image_dir
+    os.makedirs(generated_dir, exist_ok=True)
+    now = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(generated_dir, f"{prefix}_{now}.{ext}")
+    with open(path, "wb") as f:
+        f.write(content)
+    return path
+
+
 def materialize_generated_images(
     image_result: Optional[Dict[str, Any]],
     output_dir: Optional[str] = None,
@@ -111,6 +127,9 @@ def materialize_generated_images(
     urls = image_result.get("image_urls") or []
     if not urls:
         return []
+    saved = [p for p in (image_result.get("local_image_paths") or []) if p and os.path.isfile(p)]
+    if len(saved) == len(urls):
+        return saved
 
     generated_dir = output_dir or settings.paths.generated_image_dir
     os.makedirs(generated_dir, exist_ok=True)

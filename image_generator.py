@@ -19,6 +19,15 @@ from langchain_core.output_parsers import StrOutputParser
 
 from config import settings, create_moonshot_llm
 from feishu_reader import get_tenant_access_token as get_feishu_token
+from buyer_show_review import (
+    ImageReview,
+    build_retry_prompt,
+    pick_attempt,
+    prompt_diff,
+    retry_constraints,
+    review_buyer_show,
+)
+from utils import guess_image_ext, save_generated_bytes
 
 logger = logging.getLogger("image-generator")
 
@@ -339,26 +348,151 @@ def _build_outfit_reference_prompt(product_name: str, index: int, total: int) ->
     )
 
 
+def _product_only_prompt(scene_prompt: str) -> str:
+    return (
+        f"{scene_prompt}。"
+        f"保持衣服颜色和参考图一致。"
+        f"人物为中国人特征，面部自然，避免外国人或欧美模特感。"
+    )
+
+
+def _download_image(url: str) -> tuple[bytes | None, str]:
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200 or not resp.content:
+            logger.info("下载成图失败: HTTP %s", resp.status_code)
+            return None, "png"
+        return resp.content, guess_image_ext(resp.headers.get("Content-Type", ""), url)
+    except Exception as exc:
+        logger.info("下载成图异常: %s", exc)
+        return None, "png"
+
+
+def _generate_once(
+    prompt: str,
+    product_image_base64: str,
+    outfit_bytes: bytes | None,
+) -> tuple[str | None, str]:
+    if outfit_bytes:
+        return generate_lifestyle_image_with_references(
+            prompt,
+            product_image_base64,
+            _image_bytes_to_data_uri(outfit_bytes),
+        )
+    return generate_lifestyle_image(prompt, product_image_base64), ""
+
+
+def _run_attempt(
+    *,
+    round_no: int,
+    prompt: str,
+    previous_prompt: str,
+    added_constraints: list[str],
+    image_bytes: bytes,
+    product_image_base64: str,
+    outfit_bytes: bytes | None,
+) -> dict:
+    """生成一张、落到本地、交给视觉模型评审。"""
+    gen_url, reference_field = _generate_once(prompt, product_image_base64, outfit_bytes)
+    attempt = {
+        "round": round_no,
+        "prompt": prompt,
+        "added_constraints": added_constraints,
+        "diff": prompt_diff(previous_prompt, prompt) if previous_prompt else [],
+        "image_url": gen_url or "",
+        "image_path": "",
+        "reference_field": reference_field,
+        "review": ImageReview(skipped=True, error="生图失败").to_dict(),
+    }
+    if not gen_url:
+        return attempt
+    content, ext = _download_image(gen_url)
+    if content:
+        attempt["image_path"] = save_generated_bytes(content, prefix=f"ai_r{round_no}", ext=ext)
+    attempt["review"] = review_buyer_show(image_bytes, content).to_dict()
+    return attempt
+
+
+def _generate_with_review(
+    *,
+    index: int,
+    first_prompt: str,
+    image_bytes: bytes,
+    product_image_base64: str,
+    outfit_bytes: bytes | None,
+    prior_attempt: dict | None,
+    note: str,
+) -> dict:
+    """一张图最多生成两次：第2次 = 第1次原文 + 评审给出的约束。"""
+    attempts: list[dict] = []
+    previous_prompt = ""
+    added: list[str] = []
+    if prior_attempt and prior_attempt.get("prompt"):
+        prior = {**prior_attempt, "from_previous_round": True}
+        attempts.append(prior)
+        previous_prompt = prior["prompt"]
+        added = retry_constraints(ImageReview.from_dict(prior.get("review")), note)
+        first_prompt = build_retry_prompt(previous_prompt, added)
+
+    first = _run_attempt(
+        round_no=len(attempts) + 1,
+        prompt=first_prompt,
+        previous_prompt=previous_prompt,
+        added_constraints=added,
+        image_bytes=image_bytes,
+        product_image_base64=product_image_base64,
+        outfit_bytes=outfit_bytes,
+    )
+    attempts.append(first)
+
+    first_review = ImageReview.from_dict(first.get("review"))
+    if first.get("image_url") and not first_review.passed and first_review.constraints:
+        constraints = retry_constraints(first_review)
+        logger.info("第 %d 张评审未通过，追加 %d 条约束重做", index + 1, len(constraints))
+        attempts.append(_run_attempt(
+            round_no=len(attempts) + 1,
+            prompt=build_retry_prompt(first_prompt, constraints),
+            previous_prompt=first_prompt,
+            added_constraints=constraints,
+            image_bytes=image_bytes,
+            product_image_base64=product_image_base64,
+            outfit_bytes=outfit_bytes,
+        ))
+
+    start = 1 if prior_attempt and prior_attempt.get("prompt") else 0
+    picked = pick_attempt(attempts[start:])
+    chosen = picked + start if picked >= 0 else -1
+    return {"index": index, "chosen": chosen, "attempts": attempts}
+
+
 def run_image_generation(
     image_bytes: bytes,
     product_name: str,
     scene_count: int = 2,
     outfit_image_bytes_list: list[bytes] | None = None,
     commit_to_feishu: bool = True,
+    prior_attempts: list[dict] | None = None,
+    note: str = "",
 ) -> dict:
     """
     完整的图片生成主流程：
     1. 如果存在穿搭参考图，则使用商品图 + 单张穿搭图双图参考生成
        否则保留旧的 Kimi 场景 Prompt + 单图生图逻辑
-    2. doubao 逐个生成买家秀图
+    2. doubao 逐张生成，视觉模型评审；不通过就在原提示词后追加约束再生成一次
     3. commit_to_feishu=True 时写入飞书；False 时只返回候选图 URL
+
+    prior_attempts 是人工驳回时上一轮每张最终采用的尝试。
+    这时不重写场景，直接在上一轮提示词后追加人工备注和上一轮评审约束。
     """
     outfit_image_bytes_list = outfit_image_bytes_list or []
+    prior_attempts = prior_attempts or []
     result = {
         "status": "error",
         "message": "",
         "prompts": [],
         "image_urls": [],
+        "local_image_paths": [],
+        "attempts": [],
         "reference_mode": "product_plus_outfit" if outfit_image_bytes_list else "product_only",
         "outfit_reference_count": len(outfit_image_bytes_list),
         "reference_fields": [],
@@ -369,7 +503,9 @@ def run_image_generation(
     product_image_base64 = _image_bytes_to_data_uri(image_bytes)
 
     # Step 2: 生成提示词。存在穿搭参考图时使用固定强约束，减少模型自由发挥。
-    if outfit_image_bytes_list:
+    if prior_attempts:
+        prompts = [str(item.get("prompt") or "") for item in prior_attempts][:scene_count]
+    elif outfit_image_bytes_list:
         logger.info(f"🎨 检测到 {len(outfit_image_bytes_list)} 张穿搭参考图，使用双图参考生成...")
         prompts = [
             _build_outfit_reference_prompt(product_name, i + 1, scene_count)
@@ -377,41 +513,41 @@ def run_image_generation(
         ]
     else:
         logger.info(f"🎨 正在用 AI 生成 {scene_count} 个场景描述...")
-        prompts = generate_scene_prompts(product_name, scene_count)
-    result["prompts"] = prompts
+        prompts = [_product_only_prompt(p) for p in generate_scene_prompts(product_name, scene_count)]
 
     if not prompts:
         result["message"] = "❌ 生成场景描述失败"
         return result
 
-    # Step 3: 用 doubao 生成场景图。是否写飞书由后续 commit_to_feishu 决定。
+    # Step 3: 逐张生成并评审。是否写飞书由后续 commit_to_feishu 决定。
     generated_urls = []
 
     for i, prompt in enumerate(prompts):
         logger.info(f"🖼️  正在生成第 {i+1}/{len(prompts)} 张配图: {prompt[:30]}...")
-
-        if outfit_image_bytes_list:
-            outfit_bytes = outfit_image_bytes_list[i % len(outfit_image_bytes_list)]
-            outfit_image_base64 = _image_bytes_to_data_uri(outfit_bytes)
-            gen_url, reference_field = generate_lifestyle_image_with_references(
-                prompt,
-                product_image_base64,
-                outfit_image_base64,
-            )
-            if reference_field:
-                result["reference_fields"].append(reference_field)
-        else:
-            # 调用 doubao 图生图（传 base64）
-            strict_prompt = (
-                f"{prompt}。"
-                f"保持衣服颜色和参考图一致。"
-                f"人物为中国人特征，面部自然，避免外国人或欧美模特感。"
-            )
-            gen_url = generate_lifestyle_image(strict_prompt, product_image_base64)
-        if gen_url:
-            generated_urls.append(gen_url)
-        else:
+        outfit_bytes = (
+            outfit_image_bytes_list[i % len(outfit_image_bytes_list)]
+            if outfit_image_bytes_list
+            else None
+        )
+        group = _generate_with_review(
+            index=i,
+            first_prompt=prompt,
+            image_bytes=image_bytes,
+            product_image_base64=product_image_base64,
+            outfit_bytes=outfit_bytes,
+            prior_attempt=prior_attempts[i] if i < len(prior_attempts) else None,
+            note=note,
+        )
+        if group["chosen"] < 0:
             logger.info(f"  ⚠️ 第 {i+1} 张生成失败，跳过")
+            continue
+        chosen = group["attempts"][group["chosen"]]
+        result["attempts"].append(group)
+        result["prompts"].append(chosen["prompt"])
+        generated_urls.append(chosen["image_url"])
+        result["local_image_paths"].append(chosen.get("image_path") or "")
+        if chosen.get("reference_field"):
+            result["reference_fields"].append(chosen["reference_field"])
 
     result["image_urls"] = generated_urls
 
