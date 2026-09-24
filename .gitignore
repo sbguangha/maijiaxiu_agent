@@ -1,13 +1,52 @@
+# Python
 venv/
-.env
+.venv/
+env/
 __pycache__/
-*.pyc
-logs/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+
+# 本地启动备忘
+启动.md
 
 # Runtime data artifacts
 data/*.db*
+data/*.sqlite*
+data/*.jpg
+data/*.jpeg
+data/*.png
+data/*.webp
+data/*.gif
 data/generated_images/
 data/outbox_files/
 data/test_materials/
+data/_lark_tmp/
+data/docker/
+data/mcp_audit.jsonl
 output/
+lark-auth-qr.png

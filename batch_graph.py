@@ -126,6 +126,20 @@ def map_rows(state: BatchState) -> List[Send]:
     ]
 
 
+def batch_failure_reason(result: Dict[str, Any] | None, *, image_count: int, deferred: bool) -> str | None:
+    """配图没生成或没写入结果表时，返回原因。此时不能把需求行标成已处理。"""
+    result = result or {}
+    if result.get("error_message"):
+        return str(result["error_message"])
+    image_result = result.get("image_result") or {}
+    urls = image_result.get("image_urls") or []
+    if image_count > 0 and not urls:
+        return image_result.get("message") or "配图未生成"
+    if image_count > 0 and not deferred and not image_result.get("committed_to_feishu"):
+        return image_result.get("message") or "配图未写入飞书结果表"
+    return None
+
+
 def process_row_node(state: BatchState) -> Dict[str, Any]:
     """Reduc 阶段中的单行处理节点（通过 Send 并行调用）。"""
     row = state.get("row")
@@ -154,11 +168,13 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
             outfit_image_paths: List[str] = []
             token = state.get("feishu_token", "")
             if token and row.image_file_tokens:
-                image_bytes = download_attachment(token, row.image_file_tokens[0])
+                image_bytes = download_attachment(
+                    token, row.image_file_tokens[0], record_id=row.record_id
+                )
                 if image_bytes and len(image_bytes) > 100:
                     product_image_path = _save_candidate_bytes(image_bytes, "product")
                 for outfit_token in row.outfit_image_file_tokens:
-                    b = download_attachment(token, outfit_token)
+                    b = download_attachment(token, outfit_token, record_id=row.record_id)
                     if b and len(b) > 100:
                         outfit_bytes_list.append(b)
                         outfit_image_paths.append(_save_candidate_bytes(b, "outfit"))
@@ -176,7 +192,46 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                 defer_feishu_commit=require_confirmation,
             )
 
+            failure = batch_failure_reason(
+                result,
+                image_count=row.image_count,
+                deferred=require_confirmation,
+            )
+            if failure:
+                row_result.update({"status": "error", "error": failure})
+                logger.error("[batch-%s] 未改处理状态: %s %s", batch_id, row.product_title, failure)
+                return {"row_results": [row_result]}
+
             if require_confirmation:
+                from buyer_show_prompt import decide_delivery
+
+                decision = decide_delivery(
+                    result.get("image_result"),
+                    requested_count=row.image_count,
+                    require_confirmation=True,
+                )
+                if decision == "auto_accept":
+                    from image_generator import commit_images_to_feishu
+
+                    image_result = result.get("image_result") or {}
+                    commit_result = commit_images_to_feishu(
+                        row.product_title,
+                        product_image_path or image_bytes,
+                        image_result.get("image_urls") or [],
+                    )
+                    if commit_result.get("status") != "success":
+                        raise RuntimeError(commit_result.get("message") or "自动收下后写入飞书失败")
+                    if token:
+                        update_source_row_status(token, row.record_id, "已处理")
+                    row_result.update({
+                        "status": "success",
+                        "review_text": result.get("reviews_formatted", ""),
+                        "image_urls": image_result.get("image_urls", []),
+                        "task_id": result.get("task_id"),
+                    })
+                    logger.info("[batch-%s] 看图通过，已自动收下: %s", batch_id, row.product_title)
+                    return {"row_results": [row_result]}
+
                 local_image_paths = result.get("local_image_paths", []) or []
                 if not local_image_paths:
                     raise RuntimeError("候选图片未成功保存到本地，无法进入人工审核")

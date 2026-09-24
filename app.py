@@ -3,19 +3,15 @@ V3.0 买家秀生成 Agent - Web 服务入口
 
 能力：
 1. 文本/图片生成
-2. 发送任务入队（面向影刀）
-3. outbox 取单与回写接口（供影刀轮询）
-4. 批量生成：从飞书需求表读取，逐行生成评价+晒图并入队（LangGraph V2）
+2. 批量生成：从飞书需求表读取，逐行生成评价+晒图并写回飞书
+3. 图片人工审核（可选）
 """
 from __future__ import annotations
 import sys
 import io
 import os
 import asyncio
-import json
 import logging
-import re
-from datetime import datetime, timezone
 
 if sys.stdout and hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -40,20 +36,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-import requests
-
-logger = logging.getLogger("outbox-api")
+logger = logging.getLogger("maijiaxiu-api")
 
 from outbox import (
     ensure_outbox_db,
-    enqueue_task,
-    reserve_next_task,
-    peek_next_due_task,
-    ack_success,
-    ack_failure,
-    list_tasks,
-    requeue_dead_letter,
-    recover_processing_task,
     create_delivery_approval as db_create_approval,
     get_delivery_approval as db_get_approval,
     list_delivery_approvals as db_list_approvals,
@@ -61,11 +47,8 @@ from outbox import (
     reject_delivery_approval as db_reject_approval,
 )
 from utils import (
-    extract_product_name,
-    normalize_review_block,
-    format_review_text_for_delivery,
     materialize_generated_images,
-    guess_image_ext,
+    merge_replaced_images,
     parse_target_contacts,
 )
 import uvicorn
@@ -77,7 +60,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 app = FastAPI(
     title="买家秀生成 Agent V3.0",
     version="3.0",
-    description="从飞书需求表批量读取商品信息，生成评价和晒图，入队给影刀发送。"
+    description="从飞书需求表批量读取商品信息，生成评价和晒图，写回飞书。"
 )
 
 # 挂载静态资源
@@ -87,11 +70,7 @@ from config import settings  # pylint: disable=wrong-import-position
 
 OUTBOX_DB_PATH = settings.outbox.db_path
 GENERATED_IMAGE_DIR = settings.paths.generated_image_dir
-OUTBOX_FILE_DIR = settings.outbox.file_dir
 DEFAULT_TARGET_CONTACTS = settings.outbox.default_target_contacts
-HEARTBEAT_FILE = settings.outbox.heartbeat_file
-
-
 REQUIRE_DELIVERY_CONFIRMATION = settings.outbox.require_confirmation
 
 
@@ -99,34 +78,6 @@ REQUIRE_DELIVERY_CONFIRMATION = settings.outbox.require_confirmation
 async def on_startup():
     ensure_outbox_db(OUTBOX_DB_PATH)
     os.makedirs(GENERATED_IMAGE_DIR, exist_ok=True)
-    os.makedirs(OUTBOX_FILE_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(HEARTBEAT_FILE)), exist_ok=True)
-
-
-class OutboxAckSuccessRequest(BaseModel):
-    task_id: str = Field(..., description="任务 ID")
-    worker_id: str = Field(default="", description="影刀实例标识")
-    note: str = Field(default="", description="补充说明")
-
-
-class OutboxAckFailureRequest(BaseModel):
-    task_id: str = Field(..., description="任务 ID")
-    worker_id: str = Field(default="", description="影刀实例标识")
-    step: str = Field(default="", description="失败步骤")
-    error_message: str = Field(..., description="失败原因")
-    screenshot_path: str = Field(default="", description="失败截图路径")
-
-
-class OutboxHeartbeatRequest(BaseModel):
-    worker_id: str = Field(..., description="影刀实例标识")
-    status: str = Field(default="ok", description="实例状态")
-    current_task_id: str = Field(default="", description="当前任务")
-    meta: Dict[str, Any] = Field(default_factory=dict, description="附加信息")
-
-
-class OutboxRecoverRequest(BaseModel):
-    task_id: str = Field(..., description="任务 ID")
-    note: str = Field(default="", description="恢复备注")
 
 
 def _get_agent_v2():
@@ -149,16 +100,9 @@ def _get_batch_graph():
     return run_batch_generate, get_batch_state
 
 
-class OutboxEnqueueRequest(BaseModel):
-    target_contacts: List[str] = Field(default_factory=list)
-    review_text: str = Field(default="")
-    image_paths: List[str] = Field(default_factory=list)
-    file_paths: List[str] = Field(default_factory=list)
-    max_retry: int = Field(default=4, ge=1, le=10)
-
-
 class DeliveryApprovalActionRequest(BaseModel):
     note: str = Field(default="", description="确认/驳回备注")
+    image_indexes: List[int] = Field(default_factory=list, description="要重做的图片下标，从 0 开始")
 
 
 # ===== 根路径：返回聊天页面 =====
@@ -189,7 +133,7 @@ async def chat(request: Request):
         user_input = payload.get("user_input", "")
 
         if not user_input.strip():
-            return JSONResponse(content={"reply": "请输入商品名称、卖点或链接。"})
+            return JSONResponse(content={"reply": "请输入商品标题。"})
 
         _, _, _, run_agent = _get_agent_v2()
         result = await asyncio.to_thread(run_agent, user_input)
@@ -209,28 +153,19 @@ async def chat_with_image(
     user_input: str = Form(default=""),
     target_contacts: str = Form(default=""),
     target_contact: str = Form(default=""),
-    enqueue_for_delivery: bool = Form(default=True),
-    table_file: Optional[UploadFile] = File(default=None),
 ):
     """
     接收用户输入的文字 + 商品白底图。
-    流程：调用 LangGraph V2 Agent 一次性完成评价生成、配图生成、[人工确认]、入队发送。
+    流程：调用 LangGraph V2 Agent 一次性完成评价生成、配图生成、[人工确认]。
     """
     run_agent_v2, _, get_agent_state, _ = _get_agent_v2()
     image_bytes = await file.read()
 
-    file_paths: List[str] = []
-    if table_file is not None:
-        file_paths.extend(await _save_uploaded_files([table_file], prefix="table"))
-
-    # 如果前端没传联系人，强制使用环境变量
-    raw_contacts = target_contacts or target_contact
-    if not raw_contacts:
-        raw_contacts = DEFAULT_TARGET_CONTACTS
+    raw_contacts = target_contacts or target_contact or DEFAULT_TARGET_CONTACTS
     contacts = parse_target_contacts(raw_contacts)
 
     thread_id = str(uuid4())
-    require_confirmation = REQUIRE_DELIVERY_CONFIRMATION if enqueue_for_delivery and contacts else False
+    require_confirmation = REQUIRE_DELIVERY_CONFIRMATION
 
     try:
         logger.info("启动 Agent V2，thread_id=%s, require_confirmation=%s", thread_id, require_confirmation)
@@ -246,28 +181,20 @@ async def chat_with_image(
             require_confirmation=require_confirmation,
         )
 
-        # 正常完成（未启用人工确认，或确认已快速通过）
         review_text = result.get("reviews_formatted", "")
         image_result = result.get("image_result")
         local_images = result.get("local_image_paths", [])
-        task_id = result.get("task_id")
-
-        queue_result = _task_to_dict_from_state(result) if task_id else None
 
         return JSONResponse(content={
             "reply": review_text,
             "image_result": image_result,
-            "queue_result": queue_result,
-            "queue_message": "已加入发送队列" if task_id else "未入队",
             "require_confirmation": False,
             "approval_result": None,
             "materialized_images": local_images,
-            "materialized_files": file_paths,
             "thread_id": thread_id,
         })
 
     except GraphInterrupt as e:
-        # 图在 human_approval 节点中断，需要人工确认
         logger.info("Agent V2 中断等待人工确认，thread_id=%s", thread_id)
         state = get_agent_state(thread_id)
         review_text = state.get("reviews_formatted", "") if state else ""
@@ -280,20 +207,16 @@ async def chat_with_image(
             target_contacts=contacts,
             review_text=review_text,
             image_paths=local_images,
-            file_paths=file_paths,
-            max_retry=4,
+            file_paths=[],
             extra={"thread_id": thread_id, "interrupt_payload": getattr(e, "value", None)},
         )
 
         return JSONResponse(content={
             "reply": review_text,
             "image_result": state.get("image_result") if state else None,
-            "queue_result": None,
-            "queue_message": "待人工确认后发送",
             "require_confirmation": True,
             "approval_result": approval_result,
             "materialized_images": local_images,
-            "materialized_files": file_paths,
             "thread_id": thread_id,
         })
 
@@ -309,54 +232,6 @@ async def chat_with_image(
         )
 
 
-def _task_to_dict_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """从 AgentState 字典中提取出 task 相关信息。"""
-    return {
-        "task_id": state.get("task_id"),
-        "target_contacts": state.get("target_contacts", []),
-        "review_text": state.get("reviews_formatted", ""),
-        "image_paths": state.get("local_image_paths", []),
-        "file_paths": [],
-        "status": "completed" if state.get("task_id") else "pending",
-    }
-
-
-async def _save_uploaded_files(files: List[UploadFile], prefix: str = "file") -> List[str]:
-    saved: List[str] = []
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for idx, upload in enumerate(files, start=1):
-        if upload is None:
-            continue
-        content = await upload.read()
-        if not content:
-            continue
-        original = upload.filename or f"{prefix}_{idx}.bin"
-        safe_name = original.replace("\\", "_").replace("/", "_").replace(":", "_")
-        path = os.path.join(OUTBOX_FILE_DIR, f"{prefix}_{now}_{idx}_{safe_name}")
-        with open(path, "wb") as f:
-            f.write(content)
-        saved.append(path)
-    return saved
-
-
-def _task_to_dict(task) -> Dict[str, Any]:
-    return {
-        "task_id": task.task_id,
-        "target_contacts": task.target_contacts,
-        "review_text": task.review_text,
-        "image_paths": task.image_paths,
-        "file_paths": task.file_paths,
-        "status": task.status,
-        "retry_count": task.retry_count,
-        "max_retry": task.max_retry,
-        "last_error": task.last_error,
-        "next_retry_at": task.next_retry_at.isoformat() if task.next_retry_at else None,
-        "created_at": task.created_at.isoformat(),
-        "updated_at": task.updated_at.isoformat(),
-        "reserved_by": task.reserved_by,
-    }
-
-
 def _create_delivery_approval(
     *,
     source: str,
@@ -365,7 +240,6 @@ def _create_delivery_approval(
     review_text: str,
     image_paths: List[str],
     file_paths: List[str],
-    max_retry: int,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     approval = db_create_approval(
@@ -376,7 +250,6 @@ def _create_delivery_approval(
         review_text=review_text,
         image_paths=image_paths,
         file_paths=file_paths,
-        max_retry=max_retry,
         extra=extra,
     )
     return approval.to_dict()
@@ -396,7 +269,7 @@ def _read_local_file_bytes(path: str) -> bytes:
 
 
 def _confirm_image_review_approval(existing, note: str):
-    """图片审核通过：写飞书结果表、更新源需求状态、入队微信发送。"""
+    """图片审核通过：写飞书结果表，并更新源需求状态。"""
     from image_generator import commit_images_to_feishu
     from feishu_reader import get_tenant_access_token, update_source_row_status
 
@@ -424,37 +297,34 @@ def _confirm_image_review_approval(existing, note: str):
             logger.warning("更新源需求表状态失败，继续确认审核: %s", e)
             commit_result["source_status_warning"] = str(e)
 
-    task_id = None
-    if existing.target_contacts:
-        task = enqueue_task(
-            db_path=OUTBOX_DB_PATH,
-            target_contacts=existing.target_contacts,
-            review_text=existing.review_text,
-            image_paths=existing.image_paths,
-            file_paths=existing.file_paths,
-            max_retry=existing.max_retry,
-        )
-        task_id = task.task_id
-
     updated = db_confirm_approval(
         OUTBOX_DB_PATH,
         existing.approval_id,
         note=note,
-        enqueue=False,
-        queued_task_id=task_id or "__no_delivery__",
     )
     if not updated:
         raise RuntimeError("更新审核记录失败")
-    return updated, task_id, commit_result
+    return updated, commit_result
 
 
-def _regenerate_image_review_approval(existing, note: str):
-    """图片审核驳回：保留原记录为 rejected，重新生成候选图并创建新 pending 记录。"""
+def _regenerate_image_review_approval(existing, note: str, image_indexes: List[int]):
+    """图片审核驳回：只重做选中的那几张，其余原图保留。"""
     from image_generator import run_image_generation
 
     extra = existing.extra or {}
     product_image_path = extra.get("product_image_path")
     outfit_image_paths = extra.get("outfit_image_paths") or []
+    image_count = int(extra.get("image_count") or len(existing.image_paths) or 1)
+
+    indexes: List[int] = []
+    for raw in image_indexes:
+        idx = int(raw)
+        if idx < 0 or idx >= image_count or idx >= len(existing.image_paths):
+            raise RuntimeError(f"图片序号超出范围: {idx}")
+        if idx not in indexes:
+            indexes.append(idx)
+    if not indexes:
+        raise RuntimeError("请选择要重做的图片")
 
     product_image_bytes = _read_local_file_bytes(product_image_path)
     outfit_image_bytes_list = [
@@ -466,16 +336,19 @@ def _regenerate_image_review_approval(existing, note: str):
     image_result = run_image_generation(
         image_bytes=product_image_bytes,
         product_name=existing.product_title,
-        scene_count=int(extra.get("image_count") or max(len(existing.image_paths), 1)),
+        scene_count=image_count,
         outfit_image_bytes_list=outfit_image_bytes_list or None,
         commit_to_feishu=False,
+        reject_note=note or "",
+        only_indexes=indexes,
     )
     if image_result.get("status") != "success":
         raise RuntimeError(image_result.get("message") or "重新生成候选图片失败")
 
-    local_image_paths = materialize_generated_images(image_result)
-    if not local_image_paths:
-        raise RuntimeError("重新生成的候选图片未成功保存到本地")
+    replaced_paths = materialize_generated_images(image_result)
+    if len(replaced_paths) != len(indexes):
+        raise RuntimeError("重新生成的候选图片数量和选中数量不一致")
+    local_image_paths = merge_replaced_images(existing.image_paths, indexes, replaced_paths)
 
     db_reject_approval(OUTBOX_DB_PATH, existing.approval_id, note=note or "图片驳回，已重新生成")
 
@@ -486,6 +359,7 @@ def _regenerate_image_review_approval(existing, note: str):
         "image_reference_mode": image_result.get("reference_mode"),
         "image_reference_fields": image_result.get("reference_fields", []),
         "reject_note": note,
+        "replaced_indexes": indexes,
     }
     new_approval = db_create_approval(
         OUTBOX_DB_PATH,
@@ -499,39 +373,6 @@ def _regenerate_image_review_approval(existing, note: str):
         extra=new_extra,
     )
     return new_approval, image_result
-
-
-@app.get("/outbox/tasks")
-async def get_outbox_tasks(
-    limit: int = Query(default=50, ge=1, le=200),
-    status: str = Query(default=""),
-):
-    try:
-        tasks = list_tasks(OUTBOX_DB_PATH, limit=limit, status=(status or None))
-        return JSONResponse(
-            content={
-                "count": len(tasks),
-                "tasks": [_task_to_dict(task) for task in tasks],
-            }
-        )
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/enqueue")
-async def post_outbox_enqueue(payload: OutboxEnqueueRequest):
-    try:
-        task = enqueue_task(
-            db_path=OUTBOX_DB_PATH,
-            target_contacts=payload.target_contacts,
-            review_text=payload.review_text,
-            image_paths=payload.image_paths,
-            file_paths=payload.file_paths,
-            max_retry=payload.max_retry,
-        )
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=400)
 
 
 @app.get("/delivery-approvals")
@@ -564,51 +405,41 @@ async def confirm_delivery_approval(
             return JSONResponse(content={"error": "approval_not_found"}, status_code=404)
         if existing.status == "rejected":
             return JSONResponse(content={"error": "approval_already_rejected"}, status_code=400)
-        if existing.queued_task_id and existing.queued_task_id != "__pending_enqueue__":
+        if existing.status == "confirmed":
             return JSONResponse(content={"approval": existing.to_dict(), "message": "already_confirmed"})
 
         note = payload.note if payload else ""
         if _is_image_review_approval(existing):
-            updated, task_id, commit_result = await asyncio.to_thread(
+            updated, commit_result = await asyncio.to_thread(
                 _confirm_image_review_approval,
                 existing,
                 note,
             )
             return JSONResponse(content={
                 "approval": updated.to_dict(),
-                "task": {"task_id": task_id} if task_id else None,
                 "commit_result": commit_result,
-                "message": "queued" if task_id else "confirmed",
+                "message": "confirmed",
             })
 
         thread_id = existing.extra.get("thread_id") if existing.extra else None
-
-        # 如果存在 LangGraph thread_id，先恢复图执行（由图的 enqueue_delivery 节点入队）
-        task_id = None
         if thread_id:
             _, resume_agent_v2, _, _ = _get_agent_v2()
-            result = await asyncio.to_thread(resume_agent_v2, thread_id, "confirmed", note)
-            task_id = result.get("task_id")
+            await asyncio.to_thread(resume_agent_v2, thread_id, "confirmed", note)
 
-        # 更新 approval 记录，但不重复 enqueue
         updated = db_confirm_approval(
             OUTBOX_DB_PATH,
             approval_id,
             note=note,
-            enqueue=False,
-            queued_task_id=task_id or "__langgraph__",
         )
         if not updated:
             return JSONResponse(content={"error": "confirm_failed"}, status_code=500)
 
-        task_dict = _task_to_dict_from_state(result) if task_id else None
         return JSONResponse(content={
             "approval": updated.to_dict(),
-            "task": task_dict,
-            "message": "queued",
+            "message": "confirmed",
         })
     except Exception as e:
-        logger.exception("确认发送失败")
+        logger.exception("确认审核失败")
         return JSONResponse(content={"error": str(e)}, status_code=400)
 
 
@@ -621,15 +452,19 @@ async def reject_delivery_approval(
         existing = db_get_approval(OUTBOX_DB_PATH, approval_id)
         if not existing:
             return JSONResponse(content={"error": "approval_not_found"}, status_code=404)
-        if existing.queued_task_id and existing.queued_task_id != "__pending_enqueue__":
+        if existing.status == "confirmed":
             return JSONResponse(content={"error": "approval_already_confirmed"}, status_code=400)
 
         note = payload.note if payload else ""
+        image_indexes = list(payload.image_indexes) if payload else []
         if _is_image_review_approval(existing):
+            if not image_indexes:
+                return JSONResponse(content={"error": "请选择要重做的图片"}, status_code=400)
             new_approval, image_result = await asyncio.to_thread(
                 _regenerate_image_review_approval,
                 existing,
                 note,
+                image_indexes,
             )
             return JSONResponse(content={
                 "approval": new_approval.to_dict(),
@@ -650,7 +485,7 @@ async def reject_delivery_approval(
 
         return JSONResponse(content={"approval": updated.to_dict(), "message": "rejected"})
     except Exception as e:
-        logger.exception("驳回发送失败")
+        logger.exception("驳回审核失败")
         return JSONResponse(content={"error": str(e)}, status_code=400)
 
 
@@ -666,155 +501,6 @@ async def get_agent_thread_state(thread_id: str):
     except Exception as e:
         logger.exception("查询 Agent 状态失败")
         return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.get("/outbox/next")
-async def get_next_outbox_task(worker_id: str = Query(default="yingdao-worker")):
-    try:
-        worker = worker_id.strip() or "yingdao-worker"
-        task = reserve_next_task(OUTBOX_DB_PATH, worker)
-        if not task:
-            return JSONResponse(content={"task": None, "message": "no_due_task"})
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.get("/outbox/peek")
-async def peek_outbox_task():
-    """
-    只查看下一条可处理任务，不改变任务状态。
-    """
-    try:
-        task = peek_next_due_task(OUTBOX_DB_PATH)
-        if not task:
-            return JSONResponse(content={"task": None, "message": "no_due_task"})
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/ack-success")
-async def post_outbox_ack_success(payload: OutboxAckSuccessRequest):
-    try:
-        logger.info(
-            "ack-success request: task_id=%s worker_id=%s note=%s",
-            payload.task_id,
-            payload.worker_id,
-            payload.note,
-        )
-        task = ack_success(OUTBOX_DB_PATH, payload.task_id, payload.worker_id)
-        if not task:
-            logger.warning("ack-success task_not_found: task_id=%s", payload.task_id)
-            return JSONResponse(content={"error": "task_not_found"}, status_code=404)
-        logger.info(
-            "ack-success updated: task_id=%s status=%s retry_count=%s",
-            task.task_id,
-            task.status,
-            task.retry_count,
-        )
-        _append_heartbeat(
-            {
-                "event": "ack_success",
-                "worker_id": payload.worker_id,
-                "task_id": payload.task_id,
-                "note": payload.note,
-            }
-        )
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        logger.exception("ack-success exception: task_id=%s", payload.task_id)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/ack_success")
-async def post_outbox_ack_success_alias(payload: OutboxAckSuccessRequest):
-    """
-    兼容下划线路径，避免客户端路径拼写差异导致未命中。
-    """
-    return await post_outbox_ack_success(payload)
-
-
-@app.post("/outbox/ack-failure")
-async def post_outbox_ack_failure(payload: OutboxAckFailureRequest):
-    try:
-        detail = payload.error_message
-        if payload.step:
-            detail = f"[{payload.step}] {detail}"
-        if payload.screenshot_path:
-            detail = f"{detail} | screenshot={payload.screenshot_path}"
-        task = ack_failure(OUTBOX_DB_PATH, payload.task_id, detail)
-        if not task:
-            return JSONResponse(content={"error": "task_not_found"}, status_code=404)
-        _append_heartbeat(
-            {
-                "event": "ack_failure",
-                "worker_id": payload.worker_id,
-                "task_id": payload.task_id,
-                "step": payload.step,
-                "error_message": payload.error_message,
-                "screenshot_path": payload.screenshot_path,
-            }
-        )
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/ack_failure")
-async def post_outbox_ack_failure_alias(payload: OutboxAckFailureRequest):
-    """
-    兼容下划线路径，避免客户端路径拼写差异导致未命中。
-    """
-    return await post_outbox_ack_failure(payload)
-
-
-@app.post("/outbox/requeue/{task_id}")
-async def post_outbox_requeue(task_id: str):
-    try:
-        task = requeue_dead_letter(OUTBOX_DB_PATH, task_id)
-        if not task:
-            return JSONResponse(content={"error": "task_not_found"}, status_code=404)
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/recover-processing")
-async def post_outbox_recover_processing(payload: OutboxRecoverRequest):
-    try:
-        task = recover_processing_task(OUTBOX_DB_PATH, payload.task_id, payload.note)
-        if not task:
-            return JSONResponse(content={"error": "task_not_found"}, status_code=404)
-        return JSONResponse(content={"task": _task_to_dict(task)})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/outbox/heartbeat")
-async def post_outbox_heartbeat(payload: OutboxHeartbeatRequest):
-    try:
-        data = {
-            "event": "heartbeat",
-            "worker_id": payload.worker_id,
-            "status": payload.status,
-            "current_task_id": payload.current_task_id,
-            "meta": payload.meta,
-        }
-        _append_heartbeat(data)
-        return JSONResponse(content={"ok": True})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-def _append_heartbeat(data: Dict[str, Any]) -> None:
-    record = {
-        "ts": datetime.now(tz=timezone.utc).isoformat(),
-        "trace_id": str(uuid4()),
-        **data,
-    }
-    with open(HEARTBEAT_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 # ===== 批量生成 V2（LangGraph Send 并行） =====

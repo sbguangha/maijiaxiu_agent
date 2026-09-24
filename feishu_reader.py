@@ -7,17 +7,17 @@
 
 from __future__ import annotations
 
-import os
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
-
-import requests
 from config import settings
+from lark_cli import (
+    base_batch_update,
+    base_download_attachment,
+    base_record_list_all,
+    ensure_user_identity,
+)
 
 logger = logging.getLogger("feishu-reader")
-
-_BASE = "https://open.feishu.cn/open-apis"
 
 
 @dataclass
@@ -35,19 +35,9 @@ class SourceRow:
 
 
 def get_tenant_access_token() -> str:
-    """获取飞书 tenant_access_token，失败时抛异常。"""
-    app_id = settings.feishu.app_id
-    app_secret = settings.feishu.app_secret
-    if not app_id or not app_secret:
-        raise RuntimeError("FEISHU_APP_ID / FEISHU_APP_SECRET 未配置")
-    resp = requests.post(
-        f"{_BASE}/auth/v3/tenant_access_token/internal",
-        json={"app_id": app_id, "app_secret": app_secret},
-        timeout=10,
-    ).json()
-    if resp.get("code") != 0:
-        raise RuntimeError(f"获取飞书 token 失败: {resp}")
-    return resp["tenant_access_token"]
+    """兼容旧接口：飞书鉴权已改走 lark-cli 用户身份。"""
+    ensure_user_identity()
+    return "lark-cli-user"
 
 
 def list_source_records(
@@ -59,30 +49,22 @@ def list_source_records(
     """
     分页读取需求表所有记录，返回原始 record 列表。
     """
-    url = f"{_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
-    headers = {"Authorization": f"Bearer {token}"}
-    all_records: list[dict] = []
-    page_token: Optional[str] = None
-
-    while True:
-        params: dict = {"page_size": page_size}
-        if page_token:
-            params["page_token"] = page_token
-
-        resp = requests.get(url, headers=headers, params=params, timeout=30).json()
-        if resp.get("code") != 0:
-            raise RuntimeError(f"读取飞书表格失败: {resp}")
-
-        data = resp.get("data", {})
-        items = data.get("items", [])
-        all_records.extend(items)
-        logger.info("已读取 %d 条记录（本页 %d 条）", len(all_records), len(items))
-
-        if not data.get("has_more"):
-            break
-        page_token = data.get("page_token")
-
-    return all_records
+    del token, page_size
+    records = base_record_list_all(
+        app_token,
+        table_id,
+        field_names=[
+            "商品标题",
+            "商品平铺图",
+            "穿搭参考图",
+            "评价数量",
+            "晒图数量",
+            "微信联系人",
+            "处理状态",
+        ],
+    )
+    logger.info("已读取 %d 条记录", len(records))
+    return records
 
 
 def parse_source_row(record: dict) -> SourceRow | None:
@@ -90,8 +72,10 @@ def parse_source_row(record: dict) -> SourceRow | None:
     将飞书原始 record 解析为 SourceRow。
     字段名必须与表格列名完全一致。
     """
-    fields = record.get("fields", {})
-    record_id = record.get("record_id", "")
+    fields = record.get("fields")
+    if not isinstance(fields, dict):
+        fields = {k: v for k, v in record.items() if k not in {"record_id", "id", "recordId"}}
+    record_id = record.get("record_id") or record.get("id") or ""
 
     product_title = ""
     raw_title = fields.get("商品标题")
@@ -140,18 +124,22 @@ def parse_source_row(record: dict) -> SourceRow | None:
     )
 
 
-def download_attachment(token: str, file_token: str) -> bytes:
-    """
-    通过飞书 Drive API 下载附件，返回文件内容 bytes。
-    """
-    url = f"{_BASE}/drive/v1/medias/{file_token}/download"
-    headers = {"Authorization": f"Bearer {token}"}
-    resp = requests.get(url, headers=headers, timeout=60)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"下载附件 {file_token} 失败: HTTP {resp.status_code} {resp.text[:200]}"
-        )
-    return resp.content
+def download_attachment(
+    token: str,
+    file_token: str,
+    record_id: str = "",
+    app_token: str | None = None,
+    table_id: str | None = None,
+) -> bytes:
+    """通过 lark-cli 下载需求表附件。"""
+    del token
+    if not record_id:
+        raise RuntimeError("下载附件需要 record_id")
+    app_token = app_token or settings.feishu.source_app_token
+    table_id = table_id or settings.feishu.source_table_id
+    if not app_token or not table_id:
+        raise RuntimeError("FEISHU_SOURCE_APP_TOKEN / FEISHU_SOURCE_TABLE_ID 未配置")
+    return base_download_attachment(app_token, table_id, record_id, file_token)
 
 
 def fetch_all_source_rows(
@@ -196,26 +184,12 @@ def update_source_row_status(
         raise RuntimeError("FEISHU_SOURCE_APP_TOKEN / FEISHU_SOURCE_TABLE_ID 未配置")
     if not record_id:
         raise RuntimeError("record_id 不能为空")
-
-    url = f"{_BASE}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
-    # 兼容文本字段与单选字段两种常见建模方式。
-    candidates = [
-        {"fields": {"处理状态": status_value}},
-        {"fields": {"处理状态": [{"text": status_value}]}},
-    ]
-    last_resp = None
-    for payload in candidates:
-        resp = requests.put(url, headers=headers, json=payload, timeout=20)
-        data = resp.json()
-        last_resp = data
-        if data.get("code") == 0:
-            return
-    raise RuntimeError(f"更新处理状态失败: {last_resp}")
+    del token
+    base_batch_update(
+        app_token,
+        table_id,
+        {record_id: {"处理状态": [status_value]}},
+    )
 
 
 def _parse_int(value, default: int = 0) -> int:

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import logging
@@ -19,7 +20,7 @@ logger = logging.getLogger("utils")
 
 
 # ============================================================
-# 评价文案格式化（微信发送用）
+# 评价文案格式化
 # ============================================================
 
 def normalize_review_block(text: str) -> str:
@@ -35,7 +36,7 @@ def normalize_review_block(text: str) -> str:
 
 
 def format_review_text_for_delivery(raw_text: Optional[str]) -> str:
-    """统一微信发送文案格式：仅保留评价正文，每条用分隔线连接。"""
+    """统一评价正文格式：仅保留评价正文，每条用分隔线连接。"""
     text = (raw_text or "").replace("\r\n", "\n").strip()
     if not text:
         return ""
@@ -101,6 +102,18 @@ def guess_image_ext(content_type: str, url: str) -> str:
     return "png"
 
 
+def save_phone_jpeg(content: bytes, dest_jpg: str) -> str:
+    """按手机相册的压缩质量重存为 JPEG，减弱生图模型的锐利边缘。"""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(content))
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    os.makedirs(os.path.dirname(os.path.abspath(dest_jpg)), exist_ok=True)
+    image.save(dest_jpg, "JPEG", quality=75, optimize=True)
+    return dest_jpg
+
+
 def materialize_generated_images(
     image_result: Optional[Dict[str, Any]],
     output_dir: Optional[str] = None,
@@ -121,11 +134,16 @@ def materialize_generated_images(
         try:
             resp = requests.get(url, timeout=20)
             resp.raise_for_status()
-            ext = guess_image_ext(resp.headers.get("Content-Type", ""), url)
-            filename = f"ai_{now}_{idx}.{ext}"
+            filename = f"ai_{now}_{idx}.jpg"
             path = os.path.join(generated_dir, filename)
-            with open(path, "wb") as f:
-                f.write(resp.content)
+            try:
+                save_phone_jpeg(resp.content, path)
+            except Exception as image_error:
+                logger.warning("JPEG 重压失败，改为原样保存: %s", image_error)
+                ext = guess_image_ext(resp.headers.get("Content-Type", ""), url)
+                path = os.path.join(generated_dir, f"ai_{now}_{idx}.{ext}")
+                with open(path, "wb") as f:
+                    f.write(resp.content)
             saved_paths.append(path)
         except Exception as e:
             logger.warning("下载生成图失败: %s, error=%s", url, e)
@@ -143,12 +161,25 @@ URL_PATTERN = re.compile(
 
 
 def extract_product_name(user_input: str) -> str:
-    """从用户的自然语言输入中尽量提取出商品名称。"""
-    m = re.search(r'商品[：:叫是]\s*(.+?)(?:[，,。]|生成|$)', user_input)
+    """从用户的自然语言输入中尽量提取出商品名称。链接只删掉，不访问。"""
+    text = URL_PATTERN.sub(" ", user_input or "")
+    m = re.search(r'商品[：:叫是]\s*(.+?)(?:[，,。]|生成|$)', text)
     if m:
         return m.group(1).strip()
-    cleaned = re.sub(r'(帮我|请|生成|写|条评价|条评论|评价|评论|\d+条?|[，,。！])', '', user_input).strip()
+    cleaned = re.sub(r'(帮我|请|生成|写|条评价|条评论|评价|评论|\d+条?|[，,。！])', '', text).strip()
     return cleaned if cleaned else ""
+
+
+def merge_replaced_images(existing: List[str], indexes: List[int], replacements: List[str]) -> List[str]:
+    """只替换选中下标上的图片，其余保持原路径。"""
+    if len(indexes) != len(replacements):
+        raise RuntimeError("重做张数和选中张数不一致")
+    merged = list(existing)
+    for idx, path in zip(indexes, replacements):
+        if idx < 0 or idx >= len(merged):
+            raise RuntimeError(f"图片序号超出范围: {idx}")
+        merged[idx] = path
+    return merged
 
 
 def parse_target_contacts(raw: str) -> List[str]:

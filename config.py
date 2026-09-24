@@ -4,7 +4,7 @@
 所有环境变量集中定义，自动从 .env 文件读取，支持类型校验和默认值。
 使用方式：
     from config import settings
-    print(settings.llm.moonshot_api_key)
+    print(settings.llm.text_model)
 """
 
 from __future__ import annotations
@@ -30,19 +30,19 @@ class LLMSettings(BaseSettings):
         env_file_encoding="utf-8",
     )
 
-    moonshot_api_key: str = Field(default="", alias="MOONSHOT_API_KEY")
-    moonshot_base_url: str = Field(default="https://api.moonshot.cn/v1", alias="MOONSHOT_BASE_URL")
-    moonshot_model: str = Field(default="moonshot-v1-8k", alias="MOONSHOT_MODEL")
+    dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
+    dashscope_base_url: str = Field(
+        default="https://maas.qianwenaiapi.com/compatible-mode/v1",
+        alias="DASHSCOPE_BASE_URL",
+    )
+    text_model: str = Field(default="qwen3.7-plus", alias="QWEN_TEXT_MODEL")
+    vision_model: str = Field(default="qwen3.8-omni-flash", alias="QWEN_VISION_MODEL")
 
     doubao_api_key: str = Field(default="", alias="DOUBAO_API_KEY")
     doubao_api_url: str = Field(
         default="https://ark.cn-beijing.volces.com/api/v3/images/generations",
         alias="DOUBAO_API_URL",
     )
-
-    @property
-    def moonshot_enabled(self) -> bool:
-        return bool(self.moonshot_api_key)
 
     @property
     def doubao_enabled(self) -> bool:
@@ -67,7 +67,9 @@ class FeishuSettings(BaseSettings):
 
     @property
     def enabled(self) -> bool:
-        return bool(self.app_id and self.app_secret)
+        return bool(self.app_id and self.app_secret) or bool(self.source_app_token and self.source_table_id) or bool(
+            self.source_app_token and self.source_table_id
+        )
 
     @property
     def source_enabled(self) -> bool:
@@ -75,7 +77,7 @@ class FeishuSettings(BaseSettings):
 
 
 class OutboxSettings(BaseSettings):
-    """影刀发送队列配置。"""
+    """审核记录与本地任务库配置。"""
 
     model_config = SettingsConfigDict(
         env_prefix="", extra="ignore",
@@ -87,15 +89,6 @@ class OutboxSettings(BaseSettings):
         default=str(BASE_DIR / "data" / "outbox.db"),
         alias="OUTBOX_DB_PATH",
     )
-    file_dir: str = Field(
-        default=str(BASE_DIR / "data" / "outbox_files"),
-        alias="OUTBOX_FILE_DIR",
-    )
-    heartbeat_file: str = Field(
-        default=str(BASE_DIR / "logs" / "outbox_heartbeat.jsonl"),
-        alias="OUTBOX_HEARTBEAT_FILE",
-    )
-    processing_timeout_sec: int = Field(default=120, alias="OUTBOX_PROCESSING_TIMEOUT_SEC")
     require_confirmation: bool = Field(default=False, alias="REQUIRE_DELIVERY_CONFIRMATION")
     default_target_contacts: str = Field(default="", alias="WECHAT_TARGET_CONTACTS")
 
@@ -160,13 +153,14 @@ settings = AppSettings()
 # ============================================================
 
 @lru_cache(maxsize=4)
-def create_moonshot_llm(temperature: float = 0.7, max_retries: int = 3):
-    """创建 Kimi/Moonshot LLM 实例（带缓存，同参数复用同一实例）。"""
+def create_text_llm(temperature: float = 0.7, max_retries: int = 3):
+    """创建百炼文本模型（默认 qwen3.7-plus）。评价和场景句都走这里。"""
     from langchain_openai import ChatOpenAI  # pylint: disable=import-outside-toplevel
     return ChatOpenAI(
-        api_key=settings.llm.moonshot_api_key,
-        base_url=settings.llm.moonshot_base_url,
-        model=settings.llm.moonshot_model,
+        api_key=settings.llm.dashscope_api_key or "unset",
+        base_url=settings.llm.dashscope_base_url,
+        model=settings.llm.text_model,
         temperature=temperature,
         max_retries=max_retries,
+        extra_body={"enable_thinking": False},
     )

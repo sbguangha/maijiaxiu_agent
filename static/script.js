@@ -150,8 +150,8 @@ function updateTableWithResults(results) {
       const parts = [];
       if (r.approval_id) {
         parts.push(`待审核(${r.approval_id})`);
-      } else if (r.queued_task_id) {
-        parts.push('已入队');
+      } else if (r.status === 'success') {
+        parts.push('已完成');
       }
       if (r.image_urls && r.image_urls.length) parts.push(`${r.image_urls.length}张晒图`);
       noteCell.textContent = parts.join(', ') || '完成';
@@ -210,10 +210,13 @@ function renderApprovalArea(approvals) {
     let imagesHtml = '';
     if (imagePaths.length > 0) {
       imagesHtml = '<div class="approval-images">';
-      imagePaths.forEach((p) => {
+      imagePaths.forEach((p, index) => {
         const filename = p.replace(/\\/g, '/').split('/').pop();
         const url = '/generated-images/' + encodeURIComponent(filename);
-        imagesHtml += `<a href="${url}" target="_blank" class="approval-img-link"><img src="${url}" alt="晒图" class="approval-img" loading="lazy"></a>`;
+        const redo = isImageReview
+          ? `<label class="redo-toggle"><input type="checkbox" class="redo-check" value="${index}">重做这张</label>`
+          : '';
+        imagesHtml += `<div class="approval-shot">${redo}<a href="${url}" target="_blank" class="approval-img-link"><img src="${url}" alt="晒图 ${index + 1}" class="approval-img" loading="lazy"></a></div>`;
       });
       imagesHtml += '</div>';
     }
@@ -222,15 +225,15 @@ function renderApprovalArea(approvals) {
     const hasError = (item.extra || {}).image_generation_failed;
     const errorBadge = hasError ? '<span class="error-badge">生成失败</span>' : '';
 
-    html += `<div class="approval-card" id="approval-${item.approval_id}">
+    html += `<div class="approval-card" id="approval-${item.approval_id}" data-image-review="${isImageReview ? '1' : '0'}">
       <div class="approval-card-header">
         <div>
           <div class="approval-title">${escapeHtml(item.product_title || '未命名商品')}${errorBadge}</div>
           <div class="approval-meta">联系人：${escapeHtml(contacts || '-')} ｜ 图片：${imagePaths.length} 张${regenerateCount ? ` ｜ 已重生成 ${regenerateCount} 次` : ''}</div>
         </div>
         <div class="approval-actions">
-          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>${isImageReview ? '审核通过' : '确认并发送'}</button>
-          <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">${isImageReview ? '驳回并重生成' : '驳回'}</button>
+          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>审核通过</button>
+          <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">${isImageReview ? '重做选中' : '驳回'}</button>
         </div>
       </div>
       ${imagesHtml}
@@ -265,19 +268,32 @@ async function confirmApproval(approvalId) {
   await approveAction(approvalId, 'confirm', note);
 }
 
-async function rejectApproval(approvalId) {
-  const note = window.prompt('驳回原因（可选，会立即重新生成一组候选图）', '') || '';
-  await approveAction(approvalId, 'reject', note);
+function selectedImageIndexes(approvalId) {
+  return Array.from(document.querySelectorAll(`#approval-${approvalId} .redo-check:checked`))
+    .map((el) => Number(el.value))
+    .filter((n) => Number.isInteger(n));
 }
 
-async function approveAction(approvalId, action, note) {
+async function rejectApproval(approvalId) {
+  const card = document.getElementById(`approval-${approvalId}`);
+  const isImageReview = card && card.dataset.imageReview === '1';
+  const imageIndexes = isImageReview ? selectedImageIndexes(approvalId) : [];
+  if (isImageReview && imageIndexes.length === 0) {
+    alert('请先勾选要重做的图片。没勾选的会保留。');
+    return;
+  }
+  const note = window.prompt(isImageReview ? '重做备注（可选）' : '驳回原因（可选）', '') || '';
+  await approveAction(approvalId, 'reject', note, imageIndexes);
+}
+
+async function approveAction(approvalId, action, note, imageIndexes) {
   try {
     const btnSelector = `#approval-${approvalId} .approval-actions button`;
     document.querySelectorAll(btnSelector).forEach((b) => { b.disabled = true; });
     const resp = await fetch(`/delivery-approvals/${approvalId}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ note }),
+      body: JSON.stringify({ note, image_indexes: imageIndexes || [] }),
     });
     const data = await resp.json();
     if (!resp.ok || data.error) {

@@ -8,4 +8,6 @@ pydantic-settings
 langchain-openai
 langchain-core
 langgraph
-beautifulsoup4
+langgraph-checkpoint-sqlite
+pillow
+pytest

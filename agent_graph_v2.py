@@ -1,7 +1,7 @@
 """
 V3.0 LangGraph StateGraph Agent
 使用显式状态机编排买家秀生成全流程：
-  解析输入 → 爬取/提取卖点 → 生成评价 → 生成配图 → [人工确认] → 入队发送
+  解析商品标题 → 生成评价 → 生成配图 → [人工确认] → 输出结果
 支持 SQLite Checkpoint 持久化、中断恢复、人机协同。
 """
 
@@ -27,20 +27,14 @@ from config import settings
 from agent_state import AgentState
 from agent_nodes import (
     parse_input_node,
-    crawl_url_node,
-    extract_selling_points_node,
     generate_reviews_node,
-    critique_reviews_node,
     generate_images_node,
-    enqueue_delivery_node,
     format_output_node,
     human_approval_node,
     handle_error_node,
-    route_after_parse_input,
-    route_after_crawl,
+    route_after_generate_reviews,
     route_after_generate_images,
     route_after_human_approval,
-    route_after_critique,
     route_on_error,
 )
 
@@ -56,69 +50,38 @@ def _build_workflow() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     workflow.add_node("parse_input", parse_input_node)
-    workflow.add_node("crawl_url", crawl_url_node)
-    workflow.add_node("extract_selling_points", extract_selling_points_node)
     workflow.add_node("generate_reviews", generate_reviews_node)
-    workflow.add_node("critique_reviews", critique_reviews_node)
     workflow.add_node("generate_images", generate_images_node)
     workflow.add_node("human_approval", human_approval_node)
-    workflow.add_node("enqueue_delivery", enqueue_delivery_node)
     workflow.add_node("format_output", format_output_node)
     workflow.add_node("handle_error", handle_error_node)
 
     workflow.set_entry_point("parse_input")
-
+    workflow.add_edge("parse_input", "generate_reviews")
     workflow.add_conditional_edges(
-        "parse_input",
-        route_after_parse_input,
-        {"crawl_url": "crawl_url", "extract_selling_points": "extract_selling_points"},
+        "generate_reviews",
+        route_after_generate_reviews,
+        {
+            "generate_images": "generate_images",
+            "human_approval": "human_approval",
+            "format_output": "format_output",
+            "handle_error": "handle_error",
+        },
     )
-    workflow.add_conditional_edges(
-        "crawl_url",
-        route_after_crawl,
-        {"extract_selling_points": "extract_selling_points", "handle_error": "handle_error"},
-    )
-    workflow.add_edge("extract_selling_points", "generate_reviews")
-
-    # 质检→重试循环（子流程入口）
-    _add_review_quality_loop(workflow)
 
     workflow.add_conditional_edges(
         "generate_images",
         route_after_generate_images,
-        {"human_approval": "human_approval", "enqueue_delivery": "enqueue_delivery", "handle_error": "handle_error"},
+        {"human_approval": "human_approval", "format_output": "format_output", "handle_error": "handle_error"},
     )
     workflow.add_conditional_edges(
         "human_approval",
         route_after_human_approval,
-        {"enqueue_delivery": "enqueue_delivery", "format_output": "format_output", "handle_error": "handle_error"},
+        {"format_output": "format_output", "handle_error": "handle_error"},
     )
-    workflow.add_edge("enqueue_delivery", "format_output")
     workflow.add_edge("format_output", END)
     workflow.add_edge("handle_error", END)
 
-    return workflow
-
-
-def _add_review_quality_loop(workflow: StateGraph) -> None:
-    """注册评价生成 → 质检 → 重试 闭环。
-
-    流程：generate_reviews → critique_reviews →
-          若未通过且未达最大尝试次数 → 回到 generate_reviews
-          否则 → 继续后续（配图/确认/入队）
-    """
-    workflow.add_edge("generate_reviews", "critique_reviews")
-    workflow.add_conditional_edges(
-        "critique_reviews",
-        route_after_critique,
-        {
-            "retry": "generate_reviews",
-            "generate_images": "generate_images",
-            "human_approval": "human_approval",
-            "enqueue_delivery": "enqueue_delivery",
-            "handle_error": "handle_error",
-        },
-    )
     return workflow
 
 
@@ -204,10 +167,9 @@ def run_agent_v2(
     initial_state: AgentState = {
         "user_input": user_input,
         "thread_id": thread_id,
-        "product_url": None,
-        "product_info": None,
         "product_name": None,
-        "selling_points": None,
+        "garment_one_line": None,
+        "delivery_decision": None,
         "review_count": review_count,
         "image_count": image_count,
         "target_contacts": target_contacts or [],
@@ -219,13 +181,8 @@ def run_agent_v2(
         "reviews_formatted": None,
         "image_result": None,
         "local_image_paths": [],
-        "crawl_success": False,
         "skip_image_generation": False,
         "error_message": None,
-        "critique_result": None,
-        "critique_passed": False,
-        "critique_feedback": None,
-        "review_generation_attempts": 0,
         "approval_status": None,
         "approval_id": None,
         "approval_note": None,

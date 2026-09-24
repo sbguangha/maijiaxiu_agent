@@ -5,8 +5,7 @@
 - 不调用 Kimi
 - 不调用豆包
 - 不调用飞书接口
-- 不入队微信发送
-- 不启动影刀
+- 不写回飞书结果表
 
 用途：
 - 检查 8000 端口占用
@@ -99,6 +98,9 @@ def check_python_compile() -> str:
         "config.py",
         "feishu_reader.py",
         "image_generator.py",
+        "buyer_show_prompt.py",
+        "qwen_client.py",
+        "agent_tools.py",
         "outbox.py",
         "utils.py",
     ]
@@ -144,14 +146,10 @@ def check_required_env() -> str:
     from config import settings
 
     missing: list[str] = []
-    if not settings.llm.moonshot_api_key:
-        missing.append("MOONSHOT_API_KEY")
+    if not settings.llm.dashscope_api_key:
+        missing.append("DASHSCOPE_API_KEY")
     if not settings.llm.doubao_api_key:
         missing.append("DOUBAO_API_KEY")
-    if not settings.feishu.app_id:
-        missing.append("FEISHU_APP_ID")
-    if not settings.feishu.app_secret:
-        missing.append("FEISHU_APP_SECRET")
     if not settings.feishu.source_app_token:
         missing.append("FEISHU_SOURCE_APP_TOKEN")
     if not settings.feishu.source_table_id:
@@ -184,12 +182,9 @@ def check_route_compatibility() -> str:
     import agent_nodes
 
     required = [
-        "route_after_parse_input",
-        "route_after_crawl",
         "route_after_generate_reviews",
         "route_after_generate_images",
         "route_after_human_approval",
-        "route_after_critique",
     ]
     missing = [name for name in required if not hasattr(agent_nodes, name)]
     if missing:
@@ -292,7 +287,14 @@ def check_run_image_generation_safe_path() -> str:
 
     def fake_scene_prompts(*args, **kwargs) -> list[str]:
         calls["prompts_called"] = True
-        return ["不应调用 Kimi 场景提示词"]
+        return ["不应调用场景提示词"]
+
+    def fake_extract(*args, **kwargs):
+        return {"one_line": "测试卫衣", "season": "", "occasion": ""}
+
+    def fake_judge(*args, **kwargs):
+        from buyer_show_prompt import ImageChecklist
+        return ImageChecklist()
 
     def fake_reference(prompt: str, product_image_base64: str, outfit_image_base64: str):
         calls["reference_calls"].append({
@@ -307,6 +309,8 @@ def check_run_image_generation_safe_path() -> str:
         ("upload_image_to_feishu", fake_upload),
         ("write_to_feishu_table", fake_write),
         ("generate_scene_prompts", fake_scene_prompts),
+        ("extract_garment_facts", fake_extract),
+        ("judge_buyer_show", fake_judge),
         ("generate_lifestyle_image_with_references", fake_reference),
     ]
 
@@ -332,12 +336,12 @@ def check_run_image_generation_safe_path() -> str:
     if result.get("reference_mode") != "product_plus_outfit":
         raise RuntimeError(f"reference_mode 错误: {result.get('reference_mode')}")
     if calls["prompts_called"]:
-        raise RuntimeError("有穿搭参考图时不应调用 Kimi 场景提示词")
+        raise RuntimeError("有穿搭参考图且张数不超过参考图时不应另写场景提示词")
     if len(calls["reference_calls"]) != 2:
         raise RuntimeError(f"双图参考调用次数错误: {len(calls['reference_calls'])}")
     if result.get("reference_fields") != ["image", "image"]:
         raise RuntimeError(f"reference_fields 错误: {result.get('reference_fields')}")
-    return "有穿搭图时走双图参考，且不调用 Kimi 场景提示词"
+    return "有穿搭图时走双图参考，且不另写场景提示词"
 
 
 def check_agent_generate_images_node_safe_path() -> str:
@@ -447,11 +451,11 @@ def check_live_http() -> str:
     if root.status_code != 200:
         raise RuntimeError(f"GET / HTTP {root.status_code}")
 
-    # 只查 outbox/tasks，避免触发飞书外部接口。
-    tasks = requests.get(base + "/outbox/tasks?limit=5", timeout=5)
-    if tasks.status_code != 200:
-        raise RuntimeError(f"GET /outbox/tasks HTTP {tasks.status_code}: {tasks.text[:200]}")
-    return "HTTP / 与 /outbox/tasks 可访问"
+    # 只查审核列表，避免触发飞书外部接口。
+    approvals = requests.get(base + "/delivery-approvals?limit=5", timeout=5)
+    if approvals.status_code != 200:
+        raise RuntimeError(f"GET /delivery-approvals HTTP {approvals.status_code}: {approvals.text[:200]}")
+    return "HTTP / 与 /delivery-approvals 可访问"
 
 
 def main() -> int:

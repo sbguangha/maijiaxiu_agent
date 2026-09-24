@@ -374,6 +374,21 @@ body {
   gap: 0.6rem;
 }
 
+.approval-shot {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.redo-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #666);
+  cursor: pointer;
+}
+
 .approval-img-link {
   display: block;
   border-radius: 8px;

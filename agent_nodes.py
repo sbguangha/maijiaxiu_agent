@@ -5,122 +5,61 @@ LangGraph Agent 节点集合
 
 from __future__ import annotations
 
-import re
 import logging
 from typing import Any, Dict, List, Optional
 
 from langgraph.types import interrupt
 
 from agent_state import AgentState
-from agent_tools import parse_product_url, extract_selling_points, generate_reviews
-from config import create_moonshot_llm, settings
-from image_generator import run_image_generation
-from outbox import enqueue_task
+from agent_tools import generate_reviews
+from buyer_show_prompt import decide_delivery
+from image_generator import extract_garment_facts, run_image_generation
 from utils import (
     format_review_text_for_delivery,
     materialize_generated_images,
     extract_product_name,
-    URL_PATTERN,
 )
 
 logger = logging.getLogger("agent-nodes")
 
 
 def parse_input_node(state: AgentState) -> Dict[str, Any]:
-    """解析用户输入，提取商品链接和商品名称。"""
+    """从输入里取出商品标题。不访问链接。"""
     user_input = state.get("user_input", "")
 
-    match = URL_PATTERN.search(user_input)
-    product_url = match.group(0) if match else None
     product_name = extract_product_name(user_input)
 
     return {
-        "product_url": product_url,
         "product_name": product_name,
     }
 
 
-def crawl_url_node(state: AgentState) -> Dict[str, Any]:
-    """爬取商品链接获取标题和描述。"""
-
-    url = state.get("product_url")
-    if not url:
-        return {
-            "crawl_success": False,
-            "product_info": None,
-        }
-
-    try:
-        result = parse_product_url(url)
-        # parse_product_url 返回的是字符串
-        if result and "解析失败" not in result:
-            return {
-                "crawl_success": True,
-                "product_info": result,
-            }
-        else:
-            return {
-                "crawl_success": False,
-                "product_info": result,
-                "error_message": result,
-            }
-    except Exception as e:
-        logger.exception("爬取商品链接失败")
-        return {
-            "crawl_success": False,
-            "product_info": None,
-            "error_message": f"爬取失败: {str(e)}",
-        }
-
-
-def extract_selling_points_node(state: AgentState) -> Dict[str, Any]:
-    """基于商品信息提取核心卖点。"""
-
-    product_info = state.get("product_info") or state.get("product_name") or state.get("user_input", "")
-    if not product_info:
-        return {
-            "selling_points": "",
-            "error_message": "缺少商品信息，无法提取卖点",
-        }
-
-    try:
-        result = extract_selling_points(product_info)
-        return {"selling_points": result}
-    except Exception as e:
-        logger.exception("提取卖点失败")
-        return {
-            "selling_points": "",
-            "error_message": f"提取卖点失败: {str(e)}",
-        }
-
-
 def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
-    """根据商品名和卖点生成买家评价。"""
+    """根据飞书商品标题和衣服事实生成买家评价。"""
 
     product_name = state.get("product_name") or "服装商品"
-    selling_points = state.get("selling_points") or ""
     count = state.get("review_count", 5)
-
-    prompt = f"帮我生成{count}条评价，商品：{product_name}"
-    if selling_points:
-        prompt += f"，卖点：{selling_points}"
-
-    # 如果有质检反馈，注入到生成提示中
-    feedback = state.get("critique_feedback")
-    if feedback:
-        prompt += f"\n\n【上一次质检反馈，请务必按此改进】\n{feedback}"
+    garment_line = ""
+    image_bytes = state.get("product_image_bytes")
+    if image_bytes:
+        try:
+            facts = extract_garment_facts(image_bytes, product_name)
+            garment_line = str((facts or {}).get("one_line") or "")
+        except Exception as exc:
+            logger.warning("评价前看图失败，只按标题写评价: %s", exc)
 
     try:
         raw = generate_reviews(
             product_name=product_name,
-            selling_points=selling_points,
             count=count,
+            garment_line=garment_line,
+            write_feishu=False,
         )
         formatted = format_review_text_for_delivery(raw)
         return {
             "reviews_raw": raw,
             "reviews_formatted": formatted,
-            "review_generation_attempts": state.get("review_generation_attempts", 0) + 1,
+            "garment_one_line": garment_line,
         }
     except Exception as e:
         logger.exception("生成评价失败")
@@ -128,66 +67,6 @@ def generate_reviews_node(state: AgentState) -> Dict[str, Any]:
             "error_message": f"生成评价失败: {str(e)}",
             "reviews_raw": None,
             "reviews_formatted": None,
-        }
-
-
-def critique_reviews_node(state: AgentState) -> Dict[str, Any]:
-    """质检节点：用 LLM 检查生成的评价是否有 AI 味。"""
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import StrOutputParser
-
-
-    reviews = state.get("reviews_raw", "")
-    if not reviews:
-        return {
-            "critique_passed": True,
-            "critique_result": "无评价内容，跳过质检",
-            "critique_feedback": None,
-        }
-
-    llm = create_moonshot_llm(temperature=0.3, max_retries=2)
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一个专业的淘宝/天猫买家秀质检员，专门识别 AI 生成的虚假评价。
-
-请对以下评价进行质检，重点关注：
-1. **AI 味**：是否使用华丽辞藻（如"犹如、宛若、极致的、前所未有的"）、排比句、过度煽情
-2. **字数千篇一律**：真实评价有的长有的短，不要每条都是 30-50 字
-3. **过于完美**：真实评价往往夹杂极小的不满（如物流慢、线头等）
-4. **人设雷同**：不同评价是否有明显不同的口吻和视角
-
-输出格式（严格按以下格式）：
-质检结果：通过 / 不通过
-问题说明：...
-改进建议：..."""),
-        ("user", "{reviews}"),
-    ])
-
-    chain = prompt | llm | StrOutputParser()
-
-    try:
-        result = chain.invoke({"reviews": reviews})
-        match = re.search(r'质检结果[：:]\s*(通过|不通过)', result)
-        passed = match and match.group(1) == "通过"
-        feedback = None
-        if not passed:
-            m = re.search(r"改进建议[：:]\s*(.+?)(?=\Z)", result, re.S)
-            if m:
-                feedback = m.group(1).strip()
-            else:
-                feedback = result.strip()[:500]
-
-        return {
-            "critique_passed": passed,
-            "critique_result": result,
-            "critique_feedback": feedback,
-        }
-    except Exception as e:
-        logger.warning("质检调用失败，默认放行: %s", e)
-        return {
-            "critique_passed": True,
-            "critique_result": f"质检调用失败: {str(e)}",
-            "critique_feedback": None,
         }
 
 
@@ -216,16 +95,28 @@ def generate_images_node(state: AgentState) -> Dict[str, Any]:
             scene_count=image_count,
             outfit_image_bytes_list=outfit_bytes_list if outfit_bytes_list else None,
             commit_to_feishu=not state.get("defer_feishu_commit", False),
+            review_text=state.get("reviews_formatted") or "",
         )
         # 提取本地图片路径（从 image_result 中的 URL 落地）
-        # 批量图片审核模式会先保存候选图，审核通过后再写飞书和入队。
+        # 批量图片审核模式会先保存候选图，审核通过后再写飞书。
         local_paths: List[str] = []
-        if result and result.get("status") == "success":
+        if result and result.get("status") in {"success", "partial"} and result.get("image_urls"):
             local_paths = materialize_generated_images(result)
+        if result and result.get("status") == "error":
+            return {
+                "image_result": result,
+                "local_image_paths": [],
+                "error_message": result.get("message") or "配图生成失败",
+            }
 
         return {
             "image_result": result,
             "local_image_paths": local_paths,
+            "delivery_decision": decide_delivery(
+                result,
+                requested_count=image_count,
+                require_confirmation=bool(state.get("require_confirmation")),
+            ),
         }
     except Exception as e:
         logger.exception("生成配图失败")
@@ -257,42 +148,6 @@ def human_approval_node(state: AgentState) -> Dict[str, Any]:
         "approval_status": result.get("status", "rejected"),
         "approval_note": result.get("note", ""),
     }
-
-
-def enqueue_delivery_node(state: AgentState) -> Dict[str, Any]:
-    """将生成结果入队到 Outbox，供影刀消费。"""
-
-    db_path = settings.outbox.db_path
-    target_contacts = state.get("target_contacts", [])
-    review_text = state.get("reviews_formatted", "")
-    image_paths = state.get("local_image_paths", [])
-
-    if not target_contacts:
-        return {
-            "task_id": None,
-            "final_reply": "未提供微信联系人，已生成但未入队发送。",
-        }
-
-    try:
-        task = enqueue_task(
-            db_path=db_path,
-            target_contacts=target_contacts,
-            review_text=review_text,
-            image_paths=image_paths,
-            file_paths=[],
-            max_retry=4,
-        )
-        return {
-            "task_id": task.task_id,
-            "final_reply": f"已加入发送队列，任务 ID: {task.task_id}",
-        }
-    except Exception as e:
-        logger.exception("入队发送失败")
-        return {
-            "task_id": None,
-            "final_reply": f"入队失败: {str(e)}",
-            "error_message": f"入队失败: {str(e)}",
-        }
 
 
 def format_output_node(state: AgentState) -> Dict[str, Any]:
@@ -334,70 +189,35 @@ def route_on_error(state: AgentState) -> str:
 # 条件边路由函数
 # =====================================================================
 
-def route_after_parse_input(state: AgentState) -> str:
-    """解析输入后：有 URL 先爬取，否则直接提取卖点。"""
-    if state.get("product_url"):
-        return "crawl_url"
-    return "extract_selling_points"
-
-
-def route_after_crawl(state: AgentState) -> str:
-    """爬取后：无论成功失败都继续提取卖点（失败时会回退到用户输入）。"""
-    if state.get("error_message"):
-        return "handle_error"
-    return "extract_selling_points"
-
-
 def route_after_generate_reviews(state: AgentState) -> str:
-    """兼容旧版图：评价生成后继续配图/确认/入队。
-
-    新版图已改为 generate_reviews -> critique_reviews -> route_after_critique，
-    但部分旧代码仍可能导入这个路由名。
-    """
+    """评价生成后继续配图、人工确认或输出。"""
     if state.get("error_message"):
         return "handle_error"
     if state.get("skip_image_generation"):
-        return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+        return "human_approval" if state.get("require_confirmation") else "format_output"
     if state.get("product_image_bytes"):
         return "generate_images"
-    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+    return "human_approval" if state.get("require_confirmation") else "format_output"
 
 
 def route_after_generate_images(state: AgentState) -> str:
-    """生成配图后：如果需要人工确认则中断，否则直接入队。"""
+    """看图通过就自己收下。只有不完整、没看成或仍有硬伤时，才进人审。"""
     if state.get("error_message"):
         return "handle_error"
-    if state.get("require_confirmation"):
+    decision = state.get("delivery_decision") or decide_delivery(
+        state.get("image_result"),
+        requested_count=int(state.get("image_count") or 0),
+        require_confirmation=bool(state.get("require_confirmation")),
+    )
+    if decision == "fail":
+        return "handle_error"
+    if decision == "human_review":
         return "human_approval"
-    return "enqueue_delivery"
-
-
-def route_after_human_approval(state: AgentState) -> str:
-    """人工确认后：确认则入队，驳回则结束。"""
-    if state.get("error_message"):
-        return "handle_error"
-    status = state.get("approval_status")
-    if status == "confirmed":
-        return "enqueue_delivery"
     return "format_output"
 
 
-def route_after_critique(state: AgentState) -> str:
-    """质检后：通过则继续后续流程，不通过则重生成。"""
-    MAX_REVIEW_ATTEMPTS = 3
+def route_after_human_approval(state: AgentState) -> str:
+    """人工确认后进入最终输出。"""
     if state.get("error_message"):
         return "handle_error"
-    passed = state.get("critique_passed", True)
-    attempts = state.get("review_generation_attempts", 0)
-
-    if not passed and attempts < MAX_REVIEW_ATTEMPTS:
-        logger.info("质检不通过，第 %d 次重试生成评价", attempts)
-        return "retry"
-    if not passed:
-        logger.warning("质检不通过，已达最大重试次数 %d，强制放行", MAX_REVIEW_ATTEMPTS)
-
-    if state.get("skip_image_generation"):
-        return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
-    if state.get("product_image_bytes"):
-        return "generate_images"
-    return "human_approval" if state.get("require_confirmation") else "enqueue_delivery"
+    return "format_output"
